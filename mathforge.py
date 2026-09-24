@@ -80,7 +80,6 @@ except ImportError as exc:  # pragma: no cover - configuration error, not logic
         "set MATHFORGE_BOOK_WRITER to that project's directory."
     ) from exc
 
-DEFAULT_CONFIG = BOOK_WRITER / "ai_book_creator" / "config" / "ai_config_opencode_go.local.json"
 OUTPUT_ROOT = Path(os.getenv("MATHFORGE_OUTPUT") or HERE / "math_output")
 CODE_TIMEOUT = 300
 HEARTBEAT = 60  # seconds between "still running" lines on a long stage
@@ -1604,9 +1603,14 @@ def main(argv=None) -> int:
     ap.add_argument("seed", nargs="?", help="research topic to explore")
     ap.add_argument("--conjectures", type=int, default=4)
     ap.add_argument("--workers", type=int, default=1, help="conjectures pursued in parallel")
-    ap.add_argument("--config", default=str(DEFAULT_CONFIG), help="book writer AI config json")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="model for proposing, proving, coding")
-    ap.add_argument("--review-model", default=DEFAULT_REVIEW_MODEL, help="model for referee stages")
+    ap.add_argument(
+        "--provider",
+        help="book writer provider (opencode-go, claude, hyper, ...). On a terminal the book "
+             "writer's provider/model menu asks when this is omitted; otherwise the last pick is reused",
+    )
+    ap.add_argument("--config", help="book writer AI config json; skips the provider menu")
+    ap.add_argument("--model", help=f"model for proposing, proving, coding (menu default {DEFAULT_MODEL})")
+    ap.add_argument("--review-model", help=f"model for referee stages (menu default {DEFAULT_REVIEW_MODEL})")
     ap.add_argument(
         "--max-tokens",
         type=int,
@@ -1669,6 +1673,25 @@ def main(argv=None) -> int:
         ap.error(f"no lakefile found in {args.lean_project}")
 
     load_local_env()
+    if args.config:
+        args.model = args.model or DEFAULT_MODEL
+        args.review_model = args.review_model or DEFAULT_REVIEW_MODEL
+    else:
+        # The book writer's provider/model menu, so every AI script offers the
+        # same, live-refreshed choices. Picks are remembered per script.
+        from ai_book_creator.cli import choose_ai
+
+        interactive = sys.stdin.isatty() and not (args.model and args.review_model)
+        _, args.config, picked = choose_ai(
+            args.provider,
+            "review" if interactive else "auto",
+            state_file=OUTPUT_ROOT / "provider_state.json",
+            roles=("work", "review"),
+            defaults=(DEFAULT_MODEL, DEFAULT_REVIEW_MODEL),
+            default_provider="opencode-go",
+        )
+        args.model = args.model or picked[0]
+        args.review_model = args.review_model or picked[-1]
     # AIService reads these; setting them here keeps the shared book-writer
     # config file untouched.
     os.environ["AI_WRITING_MODEL"] = args.model

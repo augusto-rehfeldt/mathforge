@@ -123,6 +123,13 @@ setting `AI_WRITING_MODEL` / `AI_REVIEW_MODEL` / `AI_*_COMPLETION_TOKENS` env
 vars before constructing `AIService`, so the shared config file stays untouched.
 `set_reasoning_effort` delegates to the public AIService method; SDK methods are never wrapped.
 
+Without `--config`, provider and models come from book writer's shared menu
+(`ai_book_creator.cli.choose_ai`, roles work + review, live model list). It asks
+on a terminal and reuses the last pick otherwise; picks are remembered in
+`math_output/provider_state.json`, first defaults opencode-go with
+deepseek-v4-pro / deepseek-v4-flash. `--provider` skips the provider question;
+`--model` / `--review-model` still win over the menu.
+
 Any book-writer provider config works, so OpenAI models are reachable two ways:
 `--config <book writer>/ai_book_creator/config/ai_config_openai.local.json` (API
 key) or `ai_config_openai_oauth.json` (ChatGPT sign-in — `AIService.__init__`
