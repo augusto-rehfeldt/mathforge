@@ -54,6 +54,11 @@ not author; the cost is that the model judging novelty is the one that made the
 conjecture, which is why novelty rests on retrieved literature rather than on
 that judgement alone.
 
+**`Forge.ask`** is the only call into the AI client. Provider usage limits are
+waited out inside book writer's `AIService.generate_content` (see its CLAUDE.md),
+so a limit notice never reaches the JSON or code-block parsers here.
+`propose` asks proposers that produced nothing once more before giving up.
+
 **`Forge.write_and_run`** is the code-writing loop: ask for code, run it, hand
 failures back up to `MAX_CODE_REPAIRS` times. It repairs crashes and
 *silent* runs (exit 0 with no marker from `markers`) — never the verdict itself.

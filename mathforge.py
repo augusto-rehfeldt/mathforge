@@ -763,6 +763,8 @@ class Forge:
         # the client's default is five retries of the identical prompt, and a
         # call here can take fifteen minutes: a model that thinks itself out of
         # its output allowance would do so for over an hour before giving up.
+        # A usage limit is waited out inside AIService.generate_content, which
+        # never returns the provider's limit notice as a reply.
         return self.ai.generate_content(prompt, model_type=model_type, max_retries=2)
 
     def write_and_run(
@@ -875,16 +877,23 @@ class Forge:
         returns nothing at all -- losing the batch, and with it the run. Separate
         calls are short, run in parallel, and a failure costs one conjecture.
         """
-        nths = range(1, count + 1)
-        if workers > 1:
-            with ThreadPoolExecutor(max_workers=min(workers, count)) as pool:
-                proposals = list(pool.map(lambda n: self.propose_one(seed, n, count), nths))
-        else:
-            proposals = [self.propose_one(seed, n, count) for n in nths]
+        def fan_out(nths):
+            if workers > 1:
+                with ThreadPoolExecutor(max_workers=min(workers, len(nths))) as pool:
+                    return list(pool.map(lambda n: self.propose_one(seed, n, count), nths))
+            return [self.propose_one(seed, n, count) for n in nths]
+
+        nths = list(range(1, count + 1))
+        proposals = dict(zip(nths, fan_out(nths)))
+        # a garbled or truncated reply is often a one-off: ask those proposers once more
+        failed = [n for n, c in proposals.items() if c is None]
+        if failed:
+            log(f"asking {len(failed)} proposer(s) that produced nothing once more")
+            proposals.update(zip(failed, fan_out(failed)))
 
         # independent proposers land on the same idea now and then
         conjectures, seen = [], set()
-        for c in proposals:
+        for c in proposals.values():
             key = _slug(str(c.get("title") or c["statement"])) if c else ""
             if key and key not in seen:
                 seen.add(key)
@@ -1956,11 +1965,14 @@ def _selftest() -> None:
         "the model ran out of budget mid-thought and said nothing useful",
         '{"title": "First", "statement": "s1 again"}',
         '```json\n{"title": "Second", "statement": "s2"}\n```',
+        "still nothing useful",
     ])
     proposed = Forge(stub, Run(tmp)).propose("seed", 4)
     assert [c["id"] for c in proposed] == ["c1", "c2"], proposed
     assert [c["title"] for c in proposed] == ["First", "Second"], proposed
     assert "proposer 4 of 4" in stub.seen[3], stub.seen[3]
+    # the dud proposer is asked once more, and only it
+    assert len(stub.seen) == 5 and "proposer 2 of 4" in stub.seen[4], stub.seen[4:]
     # the dud reply is not cached, so a resume asks proposer 2 again
     assert "conjecture2" not in Run(tmp).data and "conjecture1" in Run(tmp).data
     shutil.rmtree(tmp, ignore_errors=True)
