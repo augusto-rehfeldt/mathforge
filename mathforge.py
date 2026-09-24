@@ -377,6 +377,15 @@ def run_code(code: str, workdir: Path, name: str, timeout: int = CODE_TIMEOUT):
 
 def _http_get(url: str, timeout: int = 30) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        # arXiv throttles with 406, OpenAlex with 429: one wait and retry, then give up
+        if exc.code not in (406, 429, 503):
+            raise
+        wait = exc.headers.get("Retry-After", "")  # seconds, or an HTTP date we ignore
+        time.sleep(min(int(wait), 60) if wait.isdigit() else 10)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read().decode("utf-8", "replace")
 
@@ -425,10 +434,13 @@ def search_crossref(query: str, rows: int = SEARCH_ROWS) -> list:
 def search_openalex(query: str, rows: int = SEARCH_ROWS) -> list:
     """OpenAlex: keyless, and far broader than Crossref for mathematics."""
     mail = os.getenv("OPENALEX_MAIL_ADDRESS", "")
+    # anonymous search gets 429s whenever OpenAlex is under load; a free key avoids that
+    key = os.getenv("OPENALEX_API_KEY", "")
     url = (
         f"https://api.openalex.org/works?per-page={rows}"
         "&select=id,title,abstract_inverted_index,doi"
         + (f"&mailto={urllib.parse.quote_plus(mail)}" if mail else "")
+        + (f"&api_key={urllib.parse.quote_plus(key)}" if key else "")
         + "&search=" + urllib.parse.quote_plus(query)
     )
     entries = []
@@ -521,7 +533,7 @@ def literature(queries: list, rows: int = SEARCH_ROWS, tag: str = "") -> dict:
                 found = backend(query, rows)
             except Exception as exc:  # network, XML, JSON, rate limit
                 errors.append(f"{backend.__name__}('{query}'): {type(exc).__name__}: {exc}")
-                log(f"    {backend.__name__}: {type(exc).__name__}", tag)
+                log(f"    {backend.__name__}: {type(exc).__name__}: {str(exc)[:80]}", tag)
                 found = []
             for hit in found:
                 key = hit["title"].lower()
@@ -1181,6 +1193,10 @@ def pipeline(forge: Forge, c: dict) -> dict:
         return {**c, "status": status, "falsification": falsification}
     log(f"  survived the search — {_verdict_line(falsification['output'])}", cid)
 
+    # a backend that failed (arXiv 406 throttling, OpenAlex 429) left the verdict
+    # resting on partial retrieval: drop it so --resume searches again
+    if forge.search and (run.data.get(f"{cid}.novelty") or {}).get("search_errors"):
+        run.data.pop(f"{cid}.novelty", None)
     novelty = run.stage(f"{cid}.novelty", lambda: forge.novelty(c))
     if novelty.get("verdict") == "KNOWN":
         log(f"  KNOWN — closest: {'; '.join(map(str, novelty.get('closest_known_results') or []))[:150]}", cid)
@@ -2000,6 +2016,27 @@ def _selftest() -> None:
         _LIMITERS.clear()
     assert offline["hits"] == [] and len(offline["errors"]) == len(_backends()), offline
 
+    # a throttled request (arXiv 406, OpenAlex 429) is retried once after Retry-After
+    import io
+
+    class _Reply(io.BytesIO):
+        __enter__ = lambda self: self
+        __exit__ = lambda self, *a: None
+
+    attempts, real_open = [], urllib.request.urlopen
+
+    def _throttled(request, timeout=30):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise urllib.error.HTTPError(request.full_url, 406, "Not Acceptable", {"Retry-After": "0"}, None)
+        return _Reply(b"ok")
+
+    urllib.request.urlopen = _throttled
+    try:
+        assert _http_get("https://x") == "ok" and len(attempts) == 2, attempts
+    finally:
+        urllib.request.urlopen = real_open
+
     # the spacing requirement is global: back-to-back waits pay the gap
     limiter = _RateLimiter(0.1)
     started = time.time()
@@ -2011,6 +2048,7 @@ def _selftest() -> None:
     # faithfulness is its own stage so a bad reply does not cost the Lean run
     class _FakeForge:
         lean_project = True
+        search = True
 
         def __init__(self, run, faith):
             self.run, self.faith, self.lean_runs = run, faith, 0
@@ -2044,6 +2082,13 @@ def _selftest() -> None:
     flaky.faith = {"verdict": "FAITHFUL"}
     assert pipeline(flaky, {"id": "c1", "statement": "s"})["status"] == "machine-verified"
     assert flaky.lean_runs == 1, "the Lean run was redone because faithfulness failed"
+    # novelty cached with backend errors is searched again on resume; a clean one is kept
+    flaky.run.data["c1.novelty"] = {"verdict": "UNCLEAR", "search_errors": ["search_arxiv: 406"]}
+    pipeline(flaky, {"id": "c1", "statement": "s"})
+    assert flaky.run.data["c1.novelty"] == {"verdict": "APPARENTLY_NEW"}, flaky.run.data["c1.novelty"]
+    flaky.run.data["c1.novelty"] = {"verdict": "UNCLEAR", "search_errors": []}
+    pipeline(flaky, {"id": "c1", "statement": "s"})
+    assert flaky.run.data["c1.novelty"]["verdict"] == "UNCLEAR"
 
     # one crashed conjecture must not kill the run
     real_pipeline = globals()["pipeline"]
