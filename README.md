@@ -121,3 +121,7 @@ or point `MATHFORGE_OUTPUT` at a container.
   counterexample is not.
 - **Rediscovery looks like discovery.** Small results that no one bothered to
   publish will pass every gate here.
+
+## License
+
+Released into the public domain under [CC0 1.0](LICENSE).
