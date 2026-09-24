@@ -381,8 +381,15 @@ def _http_get(url: str, timeout: int = 30) -> str:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        # arXiv throttles with 406, OpenAlex with 429: one wait and retry, then give up
-        if exc.code not in (406, 429, 503):
+        # arXiv's front end answers 406 to Python's TLS client on any uncached
+        # query, whatever the headers; curl (shipped with Windows 10+) gets through
+        if exc.code == 406 and shutil.which("curl"):
+            return subprocess.run(
+                ["curl", "-sSf", "-A", USER_AGENT, "--max-time", str(timeout), url],
+                capture_output=True, check=True,
+            ).stdout.decode("utf-8", "replace")
+        # OpenAlex throttles with 429 / 503: one wait and retry, then give up
+        if exc.code not in (429, 503):
             raise
         wait = exc.headers.get("Retry-After", "")  # seconds, or an HTTP date we ignore
         time.sleep(min(int(wait), 60) if wait.isdigit() else 10)
@@ -1761,10 +1768,7 @@ def main(argv=None) -> int:
 
     log(f"history     {len(history)} previous run(s) on record")
     scout = forge_for(Run(OUTPUT_ROOT / "_scout"))
-    try:
-        _drive(scout, forge_for, args, history)
-    except KeyboardInterrupt:
-        log("stopped; every finished stage is cached on disk, --resume picks it up")
+    _drive(scout, forge_for, args, history)
     log(f"library index: {OUTPUT_ROOT / 'index.md'}")
     return 0
 
@@ -2016,7 +2020,7 @@ def _selftest() -> None:
         _LIMITERS.clear()
     assert offline["hits"] == [] and len(offline["errors"]) == len(_backends()), offline
 
-    # a throttled request (arXiv 406, OpenAlex 429) is retried once after Retry-After
+    # a throttled request (OpenAlex 429) is retried once after Retry-After
     import io
 
     class _Reply(io.BytesIO):
@@ -2028,7 +2032,7 @@ def _selftest() -> None:
     def _throttled(request, timeout=30):
         attempts.append(1)
         if len(attempts) == 1:
-            raise urllib.error.HTTPError(request.full_url, 406, "Not Acceptable", {"Retry-After": "0"}, None)
+            raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {"Retry-After": "0"}, None)
         return _Reply(b"ok")
 
     urllib.request.urlopen = _throttled
@@ -2281,4 +2285,9 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _selftest()
     else:
-        raise SystemExit(main())
+        try:
+            raise SystemExit(main())
+        except KeyboardInterrupt:
+            # covers --resume too; the stage that was cut is simply not cached
+            log("stopped; every finished stage is cached on disk, --resume picks it up")
+            raise SystemExit(130)
