@@ -1,0 +1,4 @@
+# generated research output: runs, scripts, papers, logs
+math_output/
+__pycache__/
+*.pyc
