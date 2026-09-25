@@ -30,8 +30,11 @@ Every run lands in math_output/<slug>/ (state.json, generated scripts, paper.md)
 and is appended to math_output/index.md and index.json.
 
 Statuses a conjecture can end in:
-    refuted          a counterexample was found by the adversarial search
-    inconclusive     the search neither confirmed nor refuted (crash, timeout)
+    machine-refuted  a counterexample survived an independent re-check and Lean
+                     proved the negation of the claim with no `sorry`
+    refuted          a counterexample survived the independent re-check; no Lean
+    inconclusive     the search crashed, timed out, or its witness was rejected
+                     by the independent re-check
     known            novelty referee named it in the literature
     provisional      proved, but the referee or the independent check objected
     verified         referee accepted and the independent script re-derived it
@@ -40,7 +43,7 @@ Statuses a conjecture can end in:
                      failure); nothing is cached, so --resume retries it
 
 With --publish, the two statuses that rest on a machine verdict rather than on a
-model's opinion -- `machine-verified` and `refuted` -- are posted as public
+model's opinion -- `machine-verified` and `machine-refuted` -- are posted as public
 GitHub gists through the `gh` CLI. Nothing is published without that flag.
 """
 
@@ -86,6 +89,10 @@ HEARTBEAT = 60  # seconds between "still running" lines on a long stage
 LEAN_TIMEOUT = 900
 MAX_CODE_REPAIRS = 3
 DEFAULT_LEAN_PROJECT = Path.home() / "mathforge-lean"
+# written by setup_lean once `lake build` succeeds; a project without it is a
+# half-finished setup, and the next run resumes it instead of using it
+LEAN_READY = ".mathforge-ready"
+ELAN_BIN = Path(os.getenv("ELAN_HOME") or Path.home() / ".elan") / "bin"
 # opencode models. Pro does the proposing, proving and formalizing; flash is the
 # referee, where throughput matters more than depth.
 DEFAULT_MODEL = "deepseek-v4-pro"
@@ -230,6 +237,7 @@ VERDICT_MARKERS = (
 
 # lines _clip never drops: everything a verdict function looks for
 CLIP_KEEP = ("NO COUNTEREXAMPLE", "COUNTEREXAMPLE", "SANITY FAILED", "ALL CHECKS PASSED",
+             "REFUTATION CONFIRMED", "REFUTATION REJECTED",
              "CHECK FAILED", "declaration uses 'sorry'", "depends on axioms",
              "does not depend on any axioms")
 
@@ -551,6 +559,13 @@ def literature(queries: list, rows: int = SEARCH_ROWS, tag: str = "") -> dict:
     return {"hits": hits, "errors": errors}
 
 
+def canon_negatives(output: str) -> str:
+    """Spell every negative marker `NO COUNTEREXAMPLE`. Scripts printed
+    `NO-COUNTEREXAMPLE` and `NO_COUNTEREXAMPLES`; the leftover `COUNTEREXAMPLE`
+    read as a witness and two clean searches were published as refutations."""
+    return re.sub(r"\bNO[\s_-]+COUNTER[\s_-]?EXAMPLES?\b", "NO COUNTEREXAMPLE", output, flags=re.I)
+
+
 def classify_search(exit_code: int, output: str) -> str:
     """refuted | clean | inconclusive, from an adversarial search script's output.
 
@@ -558,6 +573,7 @@ def classify_search(exit_code: int, output: str) -> str:
     removed before looking for the positive one. Both markers present means the
     script ignored its brief, which is inconclusive, not a refutation.
     """
+    output = canon_negatives(output)
     if exit_code != 0 or "SANITY FAILED" in output:
         return "inconclusive"
     clean = "NO COUNTEREXAMPLE" in output
@@ -575,9 +591,23 @@ def check_passed(check: dict) -> bool:
     return check.get("exit_code") == 0 and "ALL CHECKS PASSED" in output and "CHECK FAILED" not in output
 
 
+def refutation_confirmed(check: dict | None) -> bool:
+    """The review model's re-check of a witness, read like check_passed."""
+    output = (check or {}).get("output", "")
+    return ((check or {}).get("exit_code") == 0 and "REFUTATION CONFIRMED" in output
+            and "REFUTATION REJECTED" not in output)
+
+
+def faithful(lean: dict | None) -> bool:
+    """A FAITHFUL back-translation the judge does not itself call trivialized."""
+    faith = (lean or {}).get("faithfulness") or {}
+    return faith.get("verdict") == "FAITHFUL" and str(faith.get("trivialized")).lower() != "true"
+
+
 def find_lean_project(explicit: str | None = None) -> Path | None:
     """Locate a Lake project with Mathlib available. None means "skip Lean"."""
-    for candidate in (explicit, os.getenv("MATHFORGE_LEAN_PROJECT"), DEFAULT_LEAN_PROJECT):
+    # an explicit path is the only candidate: a typo must not fall back silently
+    for candidate in ((explicit,) if explicit else (os.getenv("MATHFORGE_LEAN_PROJECT"), DEFAULT_LEAN_PROJECT)):
         if not candidate:
             continue
         path = Path(candidate)
@@ -597,7 +627,7 @@ def run_lean(code: str, project: Path, workdir: Path, name: str, timeout: int = 
     lean_file = scratch / f"{name}.lean"
     lean_file.write_text(code, encoding="utf-8")
     (workdir / f"{name}.lean").write_text(code, encoding="utf-8")
-    lake = shutil.which("lake") or "lake"
+    lake = _lake() or "lake"
     try:
         proc = subprocess.run(
             [lake, "env", "lean", str(lean_file)],
@@ -719,31 +749,62 @@ def lean_verdict(code: str, exit_code: int, output: str) -> dict:
     }
 
 
+def _lake() -> str | None:
+    """`lake` on PATH, else in elan's own bin. The VS Code Lean extension
+    installs elan there without touching an already-open shell's PATH, so the
+    directory is put on this process's PATH for lake's own child processes."""
+    found = shutil.which("lake")
+    if not found and (found := shutil.which("lake", path=str(ELAN_BIN))):
+        os.environ["PATH"] = f"{ELAN_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
+    return found
+
+
+def install_elan() -> bool:
+    """Run the official elan installer unattended (no prompt, stable toolchain)."""
+    if os.name == "nt":
+        # bool parameters of a .ps1 only bind from -Command, not from -File
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+               "$f = Join-Path $env:TEMP 'elan-init.ps1'; "
+               "Invoke-WebRequest https://elan.lean-lang.org/elan-init.ps1 -OutFile $f -UseBasicParsing; "
+               "& $f -NoPrompt 1 -DefaultToolchain stable; exit $LASTEXITCODE"]
+    else:
+        cmd = ["sh", "-c", "curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain stable"]
+    print("lake not found; installing elan (the Lean toolchain manager)...")
+    try:
+        subprocess.run(cmd, check=False)
+    except OSError as exc:
+        print(f"  elan install failed: {exc}")
+    return _lake() is not None
+
+
 def setup_lean(project: Path) -> int:
-    """Create a Mathlib-backed Lake project. Downloads several GB of cache."""
-    if not shutil.which("lake"):
-        print(
-            "lake not found. Install the Lean toolchain first:\n"
-            "  https://lean-lang.org/install/  (elan installs lean + lake)\n"
-            "then re-run --setup-lean."
-        )
-        return 1
-    if find_lean_project(str(project)):
-        print(f"Lean project already exists at {project}")
+    """Install elan if needed and build a Mathlib-backed Lake project. Unattended
+    and resumable: every step is safe to repeat, so an interrupted download is
+    picked up by the next call. Downloads several GB of Mathlib cache."""
+    if (project / LEAN_READY).exists():
+        print(f"Lean project ready at {project}")
         return 0
+    lake = _lake() or (install_elan() and _lake())
+    if not lake:
+        print("could not install elan automatically; install it from https://lean-lang.org/install/ "
+              "(or open a .lean file in VS Code with the Lean 4 extension) and re-run --setup-lean")
+        return 1
     project.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Creating Mathlib project at {project} (this downloads several GB)...")
-    for cmd, cwd in (
-        (["lake", "new", project.name, "math"], project.parent),
-        (["lake", "exe", "cache", "get"], project),
-        (["lake", "build"], project),
-    ):
-        print(f"  $ {' '.join(cmd)}")
+    print(f"Setting up the Mathlib project at {project} (this downloads several GB)...")
+    steps = [([lake, "exe", "cache", "get"], project), ([lake, "build"], project)]
+    if not find_lean_project(str(project)):
+        # the toolchain Mathlib pins, not whatever `stable` is today: a mismatch
+        # makes the downloaded cache useless and `lake build` compile Mathlib
+        steps.insert(0, ([lake, "+leanprover-community/mathlib4:lean-toolchain", "new", project.name, "math"],
+                         project.parent))
+    for cmd, cwd in steps:
+        print(f"  $ {' '.join(cmd[1:])}")
         result = subprocess.run(cmd, cwd=str(cwd))
         if result.returncode != 0:
-            print(f"  failed with exit {result.returncode}")
+            print(f"  failed with exit {result.returncode}; re-run --setup-lean to resume")
             return result.returncode
-    print(f"Lean project ready. Pass --lean-project {project} or set MATHFORGE_LEAN_PROJECT.")
+    (project / LEAN_READY).write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    print(f"Lean project ready at {project}.")
     return 0
 
 
@@ -758,6 +819,12 @@ class Forge:
         self.run = run
         self.lean_project = lean_project
         self.search = search
+        # set by the CLI before AIService is built; recorded so a gist can say
+        # which model did what. A resume keeps the first pair for the run-level
+        # record; code artifacts carry their own `model`, so they stay exact.
+        self.models = {"writing": os.getenv("AI_WRITING_MODEL", ""), "review": os.getenv("AI_REVIEW_MODEL", "")}
+        if all(self.models.values()):
+            run.data.setdefault("models", {"work": self.models["writing"], "review": self.models["review"]})
 
     def ask(self, prompt: str, model_type: str = "writing") -> str:
         # the client's default is five retries of the identical prompt, and a
@@ -798,7 +865,8 @@ class Forge:
             log(f"  {step}: exit {rc} in {_dur(time.time() - started)} — {_verdict_line(out)}", tag)
             silent = bool(markers) and rc == 0 and not any(m in out for m in markers)
             if (rc == 0 and not silent) or attempt == MAX_CODE_REPAIRS:
-                return {"code": code, "exit_code": rc, "output": out, "repairs": attempt}
+                return {"code": code, "exit_code": rc, "output": out, "repairs": attempt,
+                        "model": self.models.get(model_type, "")}
             log(f"  {step}: {'no verdict printed' if silent else f'failed (exit {rc})'}, asking for a repair", tag)
             complaint = (
                 "ran but never printed a verdict line. It must print exactly one of: "
@@ -843,7 +911,9 @@ class Forge:
                     "Do not survey the area first and do not weigh many candidates: settle on "
                     "one early and spend the reply making it precise.\n\n"
                     "Return ONLY a JSON object:\n"
-                    '{"title": "...", "statement": "precise natural-language statement '
+                    '{"title": "...", "headline": "the claim itself as one plain sentence of at '
+                    'most 20 words a reader grasps at a glance, e.g. every tree on p vertices has '
+                    'an even number of X", "statement": "precise natural-language statement '
                     'with all quantifiers", "notation": "definitions of every symbol used", '
                     '"search_space": "the explicit finite family a program should search for a '
                     'counterexample, with concrete bounds", "why_plausible": "the heuristic or '
@@ -919,15 +989,75 @@ class Forge:
             "- Include at least two independent sanity checks on your own implementation "
             "(known small values, a brute-force cross-check of any clever routine). Print "
             "them. If a sanity check fails, print SANITY FAILED and exit.\n"
+            "- Only search inside the claim's hypotheses (every bound such as `p >= 7`, every "
+            "side condition). A witness outside them refutes nothing.\n"
+            "- Compute the claimed side literally from the statement's own formula or "
+            "property, and compare against THAT, never against a related quantity (another "
+            "group's count, a neighbouring formula). A counterexample is a case where your "
+            "brute-force value differs from the claim's value.\n"
+            "- Before reporting a witness, recompute both sides for it a second time by the "
+            "plainest brute force available and report it only if they still differ.\n"
             "- On finding a counterexample print exactly `COUNTEREXAMPLE:` followed by the "
             "witness and the two sides of the failing relation, then exit.\n"
-            "- If the search completes clean, print exactly `NO COUNTEREXAMPLE` followed by "
-            "the exact ranges checked and the number of cases tested.\n"
+            "- If the search completes clean, print exactly `NO COUNTEREXAMPLE` (these two "
+            "words, a space, no hyphen) followed by the exact ranges checked and the number "
+            "of cases tested.\n"
             "- Exit code 0 in both cases. Never print both markers.\n"
             "Return only the script in one ```python fence.",
             f"{c['id']}_falsify",
             markers=("COUNTEREXAMPLE", "SANITY FAILED"),
         )
+
+    def confirm_refutation(self, c: dict, search_output: str) -> dict:
+        """Re-check the falsifier's witness from the statement alone.
+
+        On the review model: the falsifier is the work model, and its scripts
+        have compared against the wrong quantity, mis-read a witness, and used a
+        witness outside the hypotheses -- each printed a COUNTEREXAMPLE that was
+        published. One script's word is not a refutation.
+        """
+        return self.write_and_run(
+            "You are an independent referee checking a claimed counterexample. You do not "
+            "trust the searcher: its script may have mis-implemented a definition, compared "
+            "against the wrong quantity, or used a witness outside the hypotheses.\n\n"
+            f"CLAIM: {c['statement']}\nNOTATION: {c.get('notation', '')}\n\n"
+            f"SEARCH OUTPUT (the reported witness is in here):\n{search_output[-2000:]}\n\n"
+            "Write ONE self-contained Python 3 script that implements every definition from "
+            "scratch, takes the reported witness, checks that it satisfies EVERY hypothesis "
+            "of the claim, and evaluates the claim's conclusion at it by plain brute force, "
+            "computing the claimed side literally from the statement. Do not search for new "
+            "witnesses. Print exactly `REFUTATION CONFIRMED:` followed by the witness and "
+            "both sides if it meets the hypotheses and violates the conclusion; otherwise "
+            "print `REFUTATION REJECTED:` followed by the reason. Exit code 0 either way; no "
+            "bare `assert`. Return only the script in one ```python fence.",
+            f"{c['id']}_confirm",
+            markers=("REFUTATION CONFIRMED", "REFUTATION REJECTED"),
+            model_type="review",
+        )
+
+    def lean_refute(self, c: dict, witness: str) -> dict:
+        """Prove the negation of the whole claim in Lean by exhibiting the witness."""
+        result = self.write_and_run(
+            "You are formalizing a counterexample in Lean 4 with Mathlib.\n\n"
+            f"CLAIM (informal, believed FALSE): {c['statement']}\nNOTATION: {c.get('notation', '')}\n\n"
+            f"CONFIRMED WITNESS:\n{witness[-1500:]}\n\n"
+            "Write ONE self-contained Lean 4 file that:\n"
+            "- opens with `import Mathlib` and any `open` clauses you need;\n"
+            "- states `theorem refutation : ¬ (<the claim, formalized faithfully with all "
+            "its quantifiers and hypotheses>)`. The part inside the `¬` must be the claim "
+            "itself, not an instance and not a weakened variant: negating a stronger or "
+            "different statement proves nothing about this one;\n"
+            "- proves it by exhibiting the witness, then settling the finite computation "
+            "with `decide`, `norm_num`, `simp` or `rfl`. Do not use `native_decide` or "
+            "`sorry`; either one means the counterexample is not machine-checked.\n"
+            "- Add a comment `-- FAITHFULNESS:` explaining how each informal quantifier and "
+            "condition maps to the Lean statement.\n"
+            "Return only the Lean file in one ```lean fence.",
+            f"{c['id']}_refute",
+            lang="lean",
+        )
+        result.update(lean_verdict(result["code"], result["exit_code"], result["output"]))
+        return result
 
     def novelty(self, c: dict) -> dict:
         """Two steps: the model writes the queries, then judges what came back.
@@ -1107,7 +1237,7 @@ class Forge:
         result.update(lean_verdict(result["code"], result["exit_code"], result["output"]))
         return result
 
-    def faithfulness(self, c: dict, lean_code: str) -> dict:
+    def faithfulness(self, c: dict, lean_code: str, negated: bool = False) -> dict:
         """Back-translate the Lean statement and compare it to the informal one.
 
         Lean certifies only what the Lean statement says, and a formalization
@@ -1121,7 +1251,11 @@ class Forge:
                 "statement. Do not check the proof; only the statement.\n\n"
                 f"INFORMAL: {c['statement']}\nNOTATION: {c.get('notation', '')}\n\n"
                 f"LEAN FILE:\n```lean\n{lean_code}\n```\n\n"
-                "First translate the Lean theorem statement back into plain English on its "
+                + ("The file proves the NEGATION of the claim. Judge the statement inside the "
+                   "outer `¬` against the informal claim: it is FAITHFUL only if it is the "
+                   "claim itself. Negating a stronger claim, or a single instance, proves "
+                   "nothing about this one, so call that DIVERGENT.\n\n" if negated else "")
+                + "First translate the Lean theorem statement back into plain English on its "
                 "own terms, without looking at the informal wording for cues. Then compare. "
                 "Watch for the standard failure: hypotheses added or strengthened, the "
                 "conclusion weakened or special-cased, a quantifier narrowed to a finite "
@@ -1200,13 +1334,37 @@ def pipeline(forge: Forge, c: dict) -> dict:
     log(f"  claim: {str(c.get('statement', ''))[:150]}", cid)
 
     falsification = run.stage(f"{cid}.falsify", lambda: forge.falsify(c))
+    # every reader downstream looks for the canonical spelling
+    falsification = {**falsification, "output": canon_negatives(falsification["output"])}
     search = classify_search(falsification["exit_code"], falsification["output"])
     if search != "clean":
-        status = "refuted" if search == "refuted" else "inconclusive"
+        extra = {}
         detail = _counterexample_line(falsification["output"]) or _verdict_line(falsification["output"])
-        log(f"  {'REFUTED' if search == 'refuted' else 'INCONCLUSIVE'} — {detail}", cid)
+        if search == "refuted":
+            log(f"  search reports a counterexample — {detail}", cid)
+            confirmation = run.stage(f"{cid}.confirm", lambda: forge.confirm_refutation(c, falsification["output"]))
+            extra["confirmation"] = confirmation
+            if not refutation_confirmed(confirmation):
+                # a witness that does not survive a second model's re-check says
+                # the search script was wrong, which leaves no evidence either way
+                search, detail = "inconclusive", f"witness rejected — {_verdict_line(confirmation['output'])}"
+        status = "inconclusive"
+        if search == "refuted":
+            status = "refuted"
+            detail = _verdict_line(extra["confirmation"]["output"])
+            if forge.lean_project:
+                lean = run.stage(f"{cid}.lean_refute", lambda: forge.lean_refute(c, extra["confirmation"]["output"]))
+                if lean["compiles"] and not lean.get("faithfulness"):
+                    lean = {**lean, "faithfulness": run.stage(
+                        f"{cid}.refute_faithfulness", lambda: forge.faithfulness(c, lean["code"], negated=True))}
+                extra["lean"] = lean
+                if lean.get("sorry_free") and faithful(lean):
+                    status = "machine-refuted"
+                log(f"  lean refutation: {'sorry-free' if lean.get('sorry_free') else 'not checked'}, "
+                    f"faithfulness={(lean.get('faithfulness') or {}).get('verdict', 'n/a')}", cid)
+        log(f"  {status.upper()} — {detail}", cid)
         log(f"  finished as `{status}` in {_dur(time.time() - started)}", cid)
-        return {**c, "status": status, "falsification": falsification}
+        return {**c, "status": status, "falsification": falsification, **extra}
     log(f"  survived the search — {_verdict_line(falsification['output'])}", cid)
 
     # a backend that failed (arXiv 406 throttling, OpenAlex 429) left the verdict
@@ -1244,9 +1402,7 @@ def pipeline(forge: Forge, c: dict) -> dict:
     # a sorry-free proof of a statement that drifted from the informal claim
     # certifies the wrong theorem, so faithfulness gates the top status -- and a
     # statement the judge itself calls trivialized is not faithful to anything
-    faith = (lean or {}).get("faithfulness") or {}
-    faithful = faith.get("verdict") == "FAITHFUL" and str(faith.get("trivialized")).lower() != "true"
-    if lean and lean.get("sorry_free") and faithful:
+    if lean and lean.get("sorry_free") and faithful(lean):
         status = "machine-verified"
     elif report.get("verdict") == "VALID" and passed:
         status = "verified"
@@ -1323,9 +1479,8 @@ def negative_results(seed: str, results: list) -> str:
         if r.get("notation"):
             lines += [f"**Notation.** {r['notation']}", ""]
         output = (r.get("falsification") or {}).get("output", "")
-        if r["status"] == "refuted":
-            witness = next((ln for ln in output.splitlines() if "COUNTEREXAMPLE:" in ln), "")
-            lines += [f"**Counterexample.** `{witness.strip()}`", ""]
+        if r["status"] in REFUTED:
+            lines += [f"**Counterexample.** `{_witness(r)}`", ""]
         elif r["status"] == "known":
             novelty = r.get("novelty") or {}
             lines += [
@@ -1346,7 +1501,10 @@ def negative_results(seed: str, results: list) -> str:
     return "\n".join(lines) + "\n"
 
 
-PUBLISH_STATUSES = ("machine-verified", "refuted")
+REFUTED = ("machine-refuted", "refuted")
+# a refutation publishes only once Lean has checked it: a Python witness alone
+# published four false counterexamples before the re-check and Lean existed
+PUBLISH_STATUSES = ("machine-verified", "machine-refuted")
 DISCLAIMER = """\
 ## How this was produced
 
@@ -1354,16 +1512,18 @@ Fully automated: every statement, script, proof and formalization here was
 written by language models in a pipeline (mathforge), with no human in the loop.
 Read it as a machine-checked artifact, not as a reviewed paper.
 
-Only two outcomes are published, both resting on an exit status rather than on a
-model's opinion of its own work:
+Only two outcomes are published, both resting on Lean 4 + Mathlib rather than on
+a model's opinion of its own work:
 
-- **refuted** — an adversarial script, written from the claim alone, printed an
-  explicit counterexample. Re-run the attached script to reproduce it.
-- **machine-verified** — Lean 4 with Mathlib elaborated the proof with no
-  `sorry`, and a second model back-translated the Lean statement and judged it
-  faithful to the informal one. Lean certifies the Lean statement; the
-  back-translation is a screening filter, not an oracle, so read the attached
-  `.lean` file against the statement above.
+- **machine-refuted** — an adversarial script found a witness, a second model's
+  script re-checked it against the statement from scratch, and Lean elaborated a
+  sorry-free proof of the negation of the claim.
+- **machine-verified** — Lean elaborated the proof with no `sorry`.
+
+In both cases a second model back-translated the Lean statement and judged it
+faithful to the informal one. Lean certifies the Lean statement; the
+back-translation is a screening filter, not an oracle, so read the attached
+`.lean` file against the statement above.
 
 Novelty screening is a bounded automated search over arXiv, Crossref and
 OpenAlex with model-written queries. It is blind to books, to journals outside
@@ -1378,21 +1538,73 @@ def publishable(r: dict) -> bool:
 
 def _counterexample_line(output: str) -> str:
     """The witness line from a falsification run, without the negative marker."""
-    for line in output.splitlines():
+    for line in canon_negatives(output).splitlines():
         if "COUNTEREXAMPLE:" in line and "NO COUNTEREXAMPLE" not in line:
             return line.strip()
     return ""
 
 
-def _publication(seed: str, r: dict) -> str:
-    """The gist body: the claim, the machine verdict behind it, and the caveats."""
-    cid = r["id"]
-    refuted = r["status"] == "refuted"
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    head = "Counterexample" if refuted else "Machine-verified theorem"
+def _witness(r: dict) -> str:
+    """The re-checked witness when there is one, else the searcher's own line."""
+    confirmed = (r.get("confirmation") or {}).get("output", "")
+    line = next((ln.strip() for ln in confirmed.splitlines() if "REFUTATION CONFIRMED" in ln), "")
+    line = line or _counterexample_line((r.get("falsification") or {}).get("output", ""))
+    # the marker is for the parser; a reader wants the witness
+    return re.sub(r"^.*?(?:REFUTATION CONFIRMED|COUNTEREXAMPLE):?\s*", "", line)
+
+
+def headline(r: dict) -> str:
+    """What the gist title leads with: `Refuted: <claim>` / `Proved: <claim>`."""
+    claim = str(r.get("headline") or r.get("title") or r["id"]).strip().rstrip(".")
+    return f"{'Refuted' if r.get('status') in REFUTED else 'Proved'}: {claim}"
+
+
+def _lean_lines(lean: dict) -> list:
+    faith = lean.get("faithfulness") or {}
     lines = [
-        f"# {head}: {r.get('title', cid)}",
-        "",
+        f"- Lean 4 + Mathlib: compiled, sorry-free (`{lean.get('sorries', 0)}` occurrences of "
+        "the token in the source, none reported by the elaborator).",
+        f"- Back-translation of the Lean statement: **{faith.get('verdict', 'n/a')}**. "
+        f"{faith.get('backtranslation', '')}",
+    ]
+    if faith.get("differences"):
+        lines.append("- Noted differences: " + "; ".join(map(str, faith["differences"])))
+    return lines
+
+
+def _model_lines(r: dict, models: dict | None) -> list:
+    """Who did what. A code artifact names its own model; the rest falls back to
+    the run's work/review pair, and anything unrecorded says so."""
+    models = models or {}
+
+    def who(artifact_key: str | None, role: str) -> str:
+        artifact = r.get(artifact_key) if artifact_key else None
+        return ((artifact or {}).get("model") if isinstance(artifact, dict) else "") or models.get(role) or "not recorded"
+
+    if r.get("status") in REFUTED:
+        rows = [("Proposed the claim", None, "review"), ("Counterexample search", "falsification", "work"),
+                ("Independent re-check of the witness", "confirmation", "review")]
+    else:
+        rows = [("Proposed the claim", None, "review"), ("Counterexample search", "falsification", "work"),
+                ("Wrote the proof", None, "work"), ("Referee", None, "review"),
+                ("Independent check script", "independent_check", "review")]
+    if r.get("lean"):
+        rows += [("Lean formalization", "lean", "work"), ("Faithfulness judge", None, "review")]
+    return [f"- {label}: {who(key, role)}" for label, key, role in rows]
+
+
+def _publication(seed: str, r: dict, models: dict | None = None) -> str:
+    """The gist body: verdict first, then the claim, the evidence, the caveats."""
+    cid = r["id"]
+    refuted = r["status"] in REFUTED
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    witness = _witness(r) if refuted else ""
+    verdict = (f"**Verdict: FALSE.** Counterexample: `{witness}`" if refuted
+               else "**Verdict: TRUE.** Lean 4 + Mathlib accepted a sorry-free proof.")
+    lines = [f"# {headline(r)}", "", verdict, ""]
+    if r.get("title") and r.get("headline"):
+        lines += [f"*{r['title']}*", ""]
+    lines += [
         f"*Automated run on the seed topic \"{seed}\", {stamp}. Status: `{r['status']}`.*",
         "",
         "## Statement",
@@ -1402,24 +1614,29 @@ def _publication(seed: str, r: dict) -> str:
     ]
     if r.get("notation"):
         lines += ["## Notation", "", r["notation"], ""]
+    lean = r.get("lean") or {}
 
     if refuted:
-        witness = _counterexample_line((r.get("falsification") or {}).get("output", ""))
         lines += [
-            "## The statement is false",
+            "## Why it is false",
             "",
-            f"`{witness}`" if witness else "See the search output below.",
+            f"`{witness}`",
             "",
-            "Search output (tail):",
+            "## Machine verification",
+            "",
+            "- Adversarial search (`*_falsify.py`) reported the witness.",
+            "- Independent re-check (`*_confirm.py`, a different model, definitions "
+            "re-implemented from the statement): confirmed.",
+            *(_lean_lines(lean) if lean else ["- Lean: not run."]),
+            "",
+            "Re-check output (tail):",
             "",
             "```",
-            (r.get("falsification") or {}).get("output", "")[-1500:].strip(),
+            (r.get("confirmation") or {}).get("output", "")[-1500:].strip(),
             "```",
             "",
         ]
     else:
-        lean = r.get("lean") or {}
-        faith = lean.get("faithfulness") or {}
         check = r.get("independent_check") or {}
         novelty = r.get("novelty") or {}
         lines += [
@@ -1429,10 +1646,7 @@ def _publication(seed: str, r: dict) -> str:
             "",
             "## Machine verification",
             "",
-            f"- Lean 4 + Mathlib: compiled, sorry-free (`{lean.get('sorries', 0)}` occurrences of "
-            "the token in the source, none reported by the elaborator).",
-            f"- Back-translation of the Lean statement: **{faith.get('verdict', 'n/a')}**. "
-            f"{faith.get('backtranslation', '')}",
+            *_lean_lines(lean),
             f"- Independent script (written from the proof, definitions re-implemented from "
             f"scratch): {'passed' if check_passed(check) else 'did not pass; see attached output'}.",
             f"- Adversarial search found no counterexample: "
@@ -1442,9 +1656,8 @@ def _publication(seed: str, r: dict) -> str:
             f"{len(novelty.get('queries') or [])} queries). {novelty.get('reasoning', '')}",
             "",
         ]
-        if faith.get("differences"):
-            lines += ["Noted differences: " + "; ".join(map(str, faith["differences"])), ""]
 
+    lines += ["## Models", "", *_model_lines(r, models), ""]
     return "\n".join(lines + [DISCLAIMER])
 
 
@@ -1459,13 +1672,16 @@ def publish_gist(run: Run, seed: str, r: dict) -> dict:
     if not shutil.which("gh"):
         return {"error": "gh not on PATH; install the GitHub CLI to publish"}
     cid = r["id"]
-    body = run.path / f"{cid}_result.md"
-    body.write_text(_publication(seed, r), encoding="utf-8")
+    # a gist lists its files alphabetically: README.md sorts above c1_*.py, so
+    # the write-up is what a reader sees first
+    body = run.path / f"{cid}_gist" / "README.md"
+    body.parent.mkdir(exist_ok=True)
+    body.write_text(_publication(seed, r, run.data.get("models")), encoding="utf-8")
     # the generated artifacts are the point: a reader can re-run them
-    extras = [f"{cid}_lean.lean", f"{cid}_falsify.py", f"{cid}_check.py"]
+    extras = ([f"{cid}_refute.lean", f"{cid}_falsify.py", f"{cid}_confirm.py"] if r["status"] in REFUTED
+              else [f"{cid}_lean.lean", f"{cid}_falsify.py", f"{cid}_check.py"])
     files = [body] + [run.path / name for name in extras if (run.path / name).exists()]
-    kind = "counterexample" if r["status"] == "refuted" else "machine-verified theorem"
-    desc = f"mathforge: {kind} — {r.get('title', cid)} [{seed}]"
+    desc = f"{headline(r)} (mathforge, {r['status']})"
     try:
         proc = subprocess.run(
             ["gh", "gist", "create", "--public", "--desc", desc, *(str(f) for f in files)],
@@ -1487,9 +1703,12 @@ def publish(run: Run, seed: str, results: list) -> list:
     of a published run re-reads the URL instead of posting a duplicate gist."""
     published = []
     for r in results:
-        if not publishable(r):
-            continue
         key = f"{r['id']}.gist"
+        if not publishable(r):
+            stale = (run.data.get(key) or {}).get("url")
+            if stale:
+                log(f"PUBLIC gist {stale} no longer qualifies (now `{r['status']}`); retract it", r["id"])
+            continue
         # a failed post is not a result: drop it so --resume retries instead of
         # caching the error forever
         if not (run.data.get(key) or {}).get("url"):
@@ -1594,7 +1813,8 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
     for r in results:
         tally[r["status"]] = tally.get(r["status"], 0) + 1
     rule("results")
-    for status in ("machine-verified", "verified", "provisional", "known", "refuted", "inconclusive", "error"):
+    for status in ("machine-verified", "verified", "provisional", "known", "machine-refuted", "refuted",
+                   "inconclusive", "error"):
         if tally.get(status):
             log(f"{status:<17} {tally[status]}")
 
@@ -1689,9 +1909,9 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--runs", type=int, default=1, help="how many papers to attempt")
     ap.add_argument("--forever", action="store_true", help="keep researching until interrupted")
-    ap.add_argument("--pause", type=int, default=60, help="seconds between runs in continuous mode")
+    ap.add_argument("--pause", type=int, default=0, help="seconds between runs in continuous mode")
     ap.add_argument("--lean-project", help="Lake project with Mathlib (else auto-detected)")
-    ap.add_argument("--no-lean", action="store_true", help="skip Lean formalization")
+    ap.add_argument("--no-lean", action="store_true", help="run without Lean (required by default); nothing becomes machine-checked or publishable")
     ap.add_argument("--no-search", action="store_true", help="skip the arXiv/Crossref/OpenAlex novelty search")
     ap.add_argument(
         "--publish",
@@ -1719,6 +1939,15 @@ def main(argv=None) -> int:
     lean_project = None if args.no_lean else find_lean_project(args.lean_project)
     if args.lean_project and lean_project is None:
         ap.error(f"no lakefile found in {args.lean_project}")
+    # Lean is the only gate a model cannot talk its way past; running without it
+    # has to be asked for, so a missing or half-built default project is set up
+    # (or resumed) here rather than skipped
+    if not args.no_lean and (lean_project is None or (
+            lean_project == DEFAULT_LEAN_PROJECT and not (lean_project / LEAN_READY).exists())):
+        if setup_lean(DEFAULT_LEAN_PROJECT) != 0:
+            ap.error("Lean setup failed (see above); re-run to resume it, or pass --no-lean "
+                     "to run with no machine checks and nothing publishable")
+        lean_project = DEFAULT_LEAN_PROJECT
 
     load_local_env()
     if args.config:
@@ -1813,8 +2042,8 @@ def _drive(scout: Forge, forge_for, args, history: list) -> int:
         except Exception as exc:
             if getattr(exc, "status_code", None) in (401, 403):
                 raise SystemExit(f"the provider refused the request ({exc}); rerun with another --provider or --model")
-            log(f"seed selection failed ({type(exc).__name__}: {exc}); retrying in {args.pause}s")
-            time.sleep(args.pause)
+            log(f"seed selection failed ({type(exc).__name__}: {exc}); retrying in {max(args.pause, 60)}s")
+            time.sleep(max(args.pause, 60))  # never hot-loop a failing API
             continue
         try:
             summary = research_run(forge_for, seed, args)
@@ -1826,7 +2055,7 @@ def _drive(scout: Forge, forge_for, args, history: list) -> int:
             log(f"run failed on seed '{seed[:60]}': {type(exc).__name__}: {exc}")
             history.append({"seed": seed, "tally": {"failed": 1}})
         completed += 1
-        if args.forever or completed < args.runs:
+        if (args.forever or completed < args.runs) and args.pause:
             rule(f"{completed} run(s) done; next in {args.pause}s (Ctrl-C to stop)")
             time.sleep(args.pause)
     return completed
@@ -1862,6 +2091,9 @@ def _selftest() -> None:
     # the "NO COUNTEREXAMPLE" substring trap that a live run walked straight into
     assert classify_search(0, "NO COUNTEREXAMPLE, n<=10^6, 3141 cases") == "clean"
     assert classify_search(0, "COUNTEREXAMPLE: n=12, lhs=3 rhs=4") == "refuted"
+    # spellings live scripts used; each was published as a refutation
+    for clean_line in ("NO-COUNTEREXAMPLE: checked n=1..12", "NO_COUNTEREXAMPLES found", "No counterexample up to 9"):
+        assert classify_search(0, clean_line) == "clean", clean_line
     assert classify_search(0, "COUNTEREXAMPLE: n=5\nNO COUNTEREXAMPLE elsewhere") == "inconclusive"
     assert classify_search(0, "SANITY FAILED\nNO COUNTEREXAMPLE") == "inconclusive"
     assert classify_search(1, "NO COUNTEREXAMPLE") == "inconclusive"
@@ -1937,7 +2169,7 @@ def _selftest() -> None:
     rc, out = run_code("import time; time.sleep(5)", tmp, "t.py", timeout=1)
     assert rc == -1 and "TIMEOUT" in out, (rc, out)
 
-    if not shutil.which("lake"):
+    if not _lake():
         rc, out = run_lean("theorem t : 1 = 1 := rfl", tmp, tmp, "t")
         assert rc == -2 and "lake not found" in out, (rc, out)
         assert (tmp / "t.lean").exists(), "lean source not archived in the run directory"
@@ -2088,6 +2320,8 @@ def _selftest() -> None:
             self.run, self.faith, self.lean_runs = run, faith, 0
 
         falsify = staticmethod(lambda c: {"exit_code": 0, "output": "NO COUNTEREXAMPLE n<=9"})
+        lean_refute = staticmethod(lambda c, w: {"code": "theorem refutation", "compiles": True,
+                                                 "sorry_free": True, "axioms": 0})
         novelty = staticmethod(lambda c: {"verdict": "APPARENTLY_NEW"})
         prove = staticmethod(lambda c, e: "proof")
         referee = staticmethod(lambda c, p: {"verdict": "VALID"})
@@ -2097,7 +2331,7 @@ def _selftest() -> None:
             self.lean_runs += 1
             return {"code": "theorem t", "compiles": True, "sorry_free": True, "axioms": 0}
 
-        def faithfulness(self, c, code):
+        def faithfulness(self, c, code, negated=False):
             if isinstance(self.faith, Exception):
                 raise self.faith
             return self.faith
@@ -2123,6 +2357,22 @@ def _selftest() -> None:
     flaky.run.data["c1.novelty"] = {"verdict": "UNCLEAR", "search_errors": []}
     pipeline(flaky, {"id": "c1", "statement": "s"})
     assert flaky.run.data["c1.novelty"]["verdict"] == "UNCLEAR"
+
+    # a reported witness is refuted only after a second script re-checks it, and
+    # machine-refuted only once Lean proves the negation faithfully
+    for confirm_out, lean_on, expected in (
+        ("REFUTATION REJECTED: p=5 is outside p >= 7", True, "inconclusive"),
+        ("REFUTATION CONFIRMED: p=7", False, "refuted"),
+        ("REFUTATION CONFIRMED: p=7", True, "machine-refuted"),
+    ):
+        shutil.rmtree(tmp, ignore_errors=True)
+        liar = _FakeForge(Run(tmp), {"verdict": "FAITHFUL"})
+        liar.lean_project = lean_on
+        liar.falsify = lambda c: {"exit_code": 0, "output": "COUNTEREXAMPLE: p=5"}
+        liar.confirm_refutation = lambda c, out, o=confirm_out: {"exit_code": 0, "output": o}
+        got = pipeline(liar, {"id": "c1", "statement": "s"})
+        assert got["status"] == expected, (confirm_out, lean_on, got["status"])
+    shutil.rmtree(tmp, ignore_errors=True)
 
     # one crashed conjecture must not kill the run
     real_pipeline = globals()["pipeline"]
@@ -2155,7 +2405,7 @@ def _selftest() -> None:
         ],
     )
     assert "Kept" not in negatives, "a surviving conjecture leaked into the negative record"
-    assert "COUNTEREXAMPLE: n=7, lhs=1 rhs=2" in negatives
+    assert "**Counterexample.** `n=7, lhs=1 rhs=2`" in negatives
     assert "Wilson" in negatives and "NO COUNTEREXAMPLE up to 10^6" in negatives
     assert "ValueError: model gibberish" in negatives, "an errored conjecture was not recorded"
 
@@ -2222,9 +2472,9 @@ def _selftest() -> None:
     assert len(ticks) == quiet_after_exit, ticks
 
     # publishing: only machine verdicts qualify, and a failed post is retried
-    assert publishable({"status": "machine-verified"}) and publishable({"status": "refuted"})
-    assert not any(publishable({"status": s}) for s in ("verified", "provisional", "known", "inconclusive"))
-    mixed = [{"status": "verified"}, {"status": "refuted"}]
+    assert publishable({"status": "machine-verified"}) and publishable({"status": "machine-refuted"})
+    assert not any(publishable({"status": s}) for s in ("verified", "provisional", "known", "inconclusive", "refuted"))
+    mixed = [{"status": "verified"}, {"status": "machine-refuted"}]
     assert publish_verdict(False, mixed, []).startswith("publish: OFF") and "1 result" in publish_verdict(False, mixed, [])
     assert "NOTHING PUBLISHED" in publish_verdict(True, [{"status": "verified"}, {"status": "known"}], [])
     assert "0/1 posted" in publish_verdict(True, mixed, [])
@@ -2235,10 +2485,16 @@ def _selftest() -> None:
     assert _gist_url("nothing here") == ""
 
     negation = _publication("seed", {
-        "id": "c1", "title": "Broken", "status": "refuted", "statement": "s", "notation": "n",
-        "falsification": {"output": "sanity ok\nCOUNTEREXAMPLE: n=7, lhs=1 rhs=2"},
+        "id": "c1", "title": "Broken", "headline": "Every n is odd.", "status": "machine-refuted",
+        "statement": "s", "notation": "n",
+        "falsification": {"output": "sanity ok\nCOUNTEREXAMPLE: n=5, lhs=1 rhs=2"},
+        "confirmation": {"exit_code": 0, "output": "REFUTATION CONFIRMED: n=7, lhs=1 rhs=2"},
+        "lean": {"sorries": 0, "faithfulness": {"verdict": "FAITHFUL"}},
     })
-    assert "COUNTEREXAMPLE: n=7, lhs=1 rhs=2" in negation and "rediscovery" in negation
+    # verdict first, and the re-checked witness rather than the searcher's
+    assert negation.startswith("# Refuted: Every n is odd\n\n**Verdict: FALSE.**"), negation[:120]
+    assert "REFUTATION CONFIRMED: n=7" in negation and "n=5" not in negation and "rediscovery" in negation
+    assert headline({"id": "c3", "title": "T", "status": "machine-verified"}) == "Proved: T"
     proved = _publication("seed", {
         "id": "c2", "title": "Kept", "status": "machine-verified", "statement": "s",
         "proof": "PROOF BODY", "falsification": {"output": "NO COUNTEREXAMPLE up to 10^6"},
@@ -2247,6 +2503,13 @@ def _selftest() -> None:
         "lean": {"sorries": 0, "faithfulness": {"verdict": "FAITHFUL", "backtranslation": "BT"}},
     })
     assert "PROOF BODY" in proved and "FAITHFUL" in proved and "NO COUNTEREXAMPLE up to 10^6" in proved
+    # an artifact's own model wins over the run pair; nothing recorded says so
+    credited = _publication("seed", {"id": "c1", "status": "machine-refuted", "statement": "s",
+                                     "confirmation": {"output": "", "model": "checker-x"}},
+                            {"work": "work-y", "review": "review-z"})
+    assert "- Independent re-check of the witness: checker-x" in credited
+    assert "- Counterexample search: work-y" in credited and "- Proposed the claim: review-z" in credited
+    assert "- Wrote the proof: not recorded" in proved
 
     pub_run = Run(OUTPUT_ROOT / "_publishtest")
     posts = []
@@ -2256,7 +2519,7 @@ def _selftest() -> None:
         {"error": "offline"} if len(posts) == 1 else {"url": "https://gist.github.com/x", "title": r["id"]},
     )[1]
     try:
-        one = {"id": "c1", "status": "refuted", "statement": "s"}
+        one = {"id": "c1", "status": "machine-refuted", "statement": "s"}
         assert publish(pub_run, "seed", [one, {"id": "c2", "status": "known"}]) == []
         assert publish(pub_run, "seed", [one])[0]["url"] == "https://gist.github.com/x"
         assert publish(pub_run, "seed", [one])  # cached, no third post

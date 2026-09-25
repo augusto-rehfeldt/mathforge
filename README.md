@@ -14,6 +14,8 @@ program, a compiler, or a model reading evidence it did not produce.
 |---|---|---|
 | Propose | work model | the seed topic only |
 | Falsify | work model, writes a search script | the claim, not the proposer's reasoning — it is rewarded for breaking it |
+| Confirm | review model, writes a second script | a reported witness; re-checks the hypotheses and both sides from the statement alone |
+| Lean refutation | work model, `lake env lean` | a confirmed witness; proves `¬ (claim)` sorry-free, then back-translated like the proof |
 | Novelty | review model + arXiv, Crossref, OpenAlex | the statement, plus retrieved abstracts |
 | Prove | work model | the claim and the search evidence |
 | Referee | review model | the proof, told to find the error |
@@ -30,8 +32,9 @@ so the two executable verdicts do not share a single model's blind spots.
 
 | Status | Meaning |
 |---|---|
-| `refuted` | the adversarial search produced a counterexample |
-| `inconclusive` | the search crashed, timed out, or never reported |
+| `machine-refuted` | a counterexample survived the independent re-check, and Lean proved the negation of the (faithfully formalized) claim with no `sorry` |
+| `refuted` | a counterexample survived the independent re-check; Lean did not certify it |
+| `inconclusive` | the search crashed, timed out, never reported, or its witness was rejected by the re-check |
 | `known` | the novelty referee found it in the literature or recalled it |
 | `provisional` | proved, but the referee or the independent check objected |
 | `verified` | referee accepted and an independently written script re-derived it |
@@ -62,9 +65,15 @@ both are normally thrown away, and neither is expensive to keep.
 
 `--publish` posts a **public** GitHub gist for each result whose status comes
 from a machine verdict rather than a model's opinion: `machine-verified` (Lean
-compiled it sorry-free and the back-translation was faithful) and `refuted` (an
-adversarial script printed a counterexample). Nothing else is published, and
-nothing at all without the flag.
+compiled it sorry-free and the back-translation was faithful) and
+`machine-refuted` (a counterexample re-checked by a second model's script, with
+the negation proved in Lean). A bare `refuted` is not published: four
+single-script "counterexamples" posted in September 2026 were false. Nothing
+else is published, and nothing at all without the flag.
+
+A gist's title leads with the verdict and the claim in one sentence —
+`Refuted: …` / `Proved: …`, from the proposer's `headline` field — and the body
+opens with a `Verdict:` line before the full statement.
 
 Each gist carries the statement, the proof or the counterexample, the
 verification detail, and the generated `.lean` / `.py` artifacts so a reader can

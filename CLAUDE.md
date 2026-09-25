@@ -9,7 +9,7 @@ python mathforge.py --selftest              # the entire test suite; offline, no
 python mathforge.py "seed topic"            # one run
 python mathforge.py --forever --workers 4   # continuous mode, self-chosen topics
 python mathforge.py --resume math_output/<slug>   # bare --resume takes the newest run
-python mathforge.py --setup-lean            # one-off Mathlib Lake project (multi-GB)
+python mathforge.py --setup-lean            # elan + Mathlib Lake project (multi-GB); runs also do this
 ```
 
 `--selftest` is intercepted in `__main__` before `argparse` runs, so it is not a
@@ -64,9 +64,24 @@ failures back up to `MAX_CODE_REPAIRS` times. It repairs crashes and
 *silent* runs (exit 0 with no marker from `markers`) — never the verdict itself.
 A clean run that refutes the conjecture is a result, not a bug to be repaired.
 
-**`pipeline(forge, c)`** is one conjecture end to end: falsify → novelty →
+**`pipeline(forge, c)`** is one conjecture end to end: falsify (→ confirm →
+Lean refutation, when the search reports a witness) → novelty →
 prove → referee (+ one repair round if not VALID) → independent check → Lean →
-faithfulness. Early exits produce `refuted`/`inconclusive`/`known`; a crashed
+faithfulness. A reported witness is only a claim: `cN.confirm` (review model,
+`refutation_confirmed`) re-checks it from the statement, and a rejection makes
+the result `inconclusive` — live falsifiers compared against the wrong quantity,
+mis-computed a witness, and used one outside the hypotheses. A confirmed one goes
+to `cN.lean_refute` (`theorem refutation : ¬ (claim)`) and
+`cN.refute_faithfulness` (`faithfulness(..., negated=True)`); sorry-free and
+faithful gives `machine-refuted`, otherwise `refuted`. Lean is required: a run
+with no ready project calls `setup_lean` itself, which installs elan unattended
+if `lake` is missing (`install_elan`), creates `~/mathforge-lean` on the
+toolchain Mathlib pins (`lake +leanprover-community/mathlib4:lean-toolchain new`),
+fetches the cache and builds. Every step is repeatable and only a finished build
+writes `LEAN_READY`, so an interrupted setup resumes on the next run. `_lake()`
+also looks in `~/.elan/bin`, where the VS Code Lean extension installs elan
+without updating an open shell's PATH. Only `--no-lean` skips all of this.
+Early exits produce `machine-refuted`/`refuted`/`inconclusive`/`known`; a crashed
 conjecture is recorded as `error` by `run_one` (which `research_run` calls for
 every conjecture) without killing the rest of the run, and nothing is cached
 for it so `--resume` retries. The final
@@ -163,7 +178,10 @@ Model replies are unreliable, and the salvage logic in `_json_block` /
 concatenated objects with no enclosing array, NDJSON, and replies truncated
 mid-object (complete objects are kept, the partial one dropped). `classify_search`
 strips `NO COUNTEREXAMPLE` before looking for `COUNTEREXAMPLE`, because the
-negative marker contains the positive one — a trap a live run walked into. Both
+negative marker contains the positive one — a trap a live run walked into.
+`canon_negatives` first rewrites `NO-COUNTEREXAMPLE`, `NO_COUNTEREXAMPLES` and
+lowercase spellings to the canonical one; `pipeline` applies it to the cached
+search output too, so old runs re-classify on `--resume`. Both
 markers present means the script ignored its brief: `inconclusive`, not refuted.
 
 ### Output layout
@@ -177,10 +195,16 @@ to `Forge.next_seed` in continuous mode so it avoids repeating topics.
 ### Publishing
 
 `--publish` posts a **public** gist through the `gh` CLI for each result whose
-status rests on a machine verdict — `machine-verified` and `refuted` only
+status rests on Lean — `machine-verified` and `machine-refuted` only
 (`PUBLISH_STATUSES`). Gist URLs are cached in `state.json` so a resumed run
-reuses rather than reposts, and a failed post retries on the next resume. A gist
-is public the instant it is created.
+reuses rather than reposts, and a failed post retries on the next resume. A
+cached gist whose result no longer qualifies is logged loudly, never deleted
+automatically. The gist ends with a `## Models` section (`_model_lines`): code
+artifacts record their own `model` in `write_and_run`, and the rest fall back to
+the run's `models` pair that `Forge.__init__` stores in `state.json`; runs from
+before that record say `not recorded`. The body goes up as `<cN>_gist/README.md` because a gist lists
+files alphabetically; the title is `headline(r)`. A gist is public the instant
+it is created.
 
 ## Security
 
