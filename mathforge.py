@@ -72,7 +72,7 @@ BOOK_WRITER = Path(os.getenv("MATHFORGE_BOOK_WRITER") or HERE.parent / "book wri
 sys.path.insert(0, str(BOOK_WRITER))
 
 try:
-    from ai_book_creator.env import load_local_env  # noqa: E402
+    from ai_book_creator.env import exit_on_ctrl_c, load_local_env  # noqa: E402
     from ai_book_creator.services.ai_service import AIService  # noqa: E402
 except ImportError as exc:  # pragma: no cover - configuration error, not logic
     raise SystemExit(
@@ -1503,6 +1503,19 @@ def publish(run: Run, seed: str, results: list) -> list:
     return published
 
 
+def publish_verdict(enabled: bool, results: list, published: list) -> str:
+    """One end-of-seed line saying whether anything went public, and why not."""
+    qualifying = sum(publishable(r) for r in results)
+    rule_ = f"only {' / '.join(PUBLISH_STATUSES)} qualify"
+    if not enabled:
+        return f"publish: OFF (no --publish); {qualifying} result(s) would have qualified"
+    if not qualifying:
+        return f"publish: NOTHING PUBLISHED, no result qualified ({rule_})"
+    if len(published) < qualifying:
+        return f"publish: {len(published)}/{qualifying} posted, rest failed; --resume retries them"
+    return f"publish: {len(published)} gist(s) posted"
+
+
 def latest_run_dir() -> Path | None:
     """The most recently touched run, for a bare `--resume`. Underscore-prefixed
     scratch directories (`_scout`, `_selftest`) are not runs."""
@@ -1607,6 +1620,7 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
 
     elapsed = time.time() - started
     log(f"paper: {paper_path}" if paper_path else "nothing survived; no paper written")
+    log(publish_verdict(getattr(args, "publish", False), results, published))
     log(f"seed done in {_dur(elapsed)}: {seed[:60]}")
 
     def _relative(p: Path | None) -> str | None:
@@ -1693,6 +1707,8 @@ def main(argv=None) -> int:
 
     # stages are minutes apart; keep progress visible when piped to a log
     sys.stdout.reconfigure(line_buffering=True)
+    # stop at once, not after the model call in flight; the cut stage is simply not cached
+    exit_on_ctrl_c(message="stopped; every finished stage is cached on disk, --resume picks it up")
 
     if args.setup_lean:
         return setup_lean(Path(args.lean_project) if args.lean_project else DEFAULT_LEAN_PROJECT)
@@ -1795,6 +1811,8 @@ def _drive(scout: Forge, forge_for, args, history: list) -> int:
                     seed = scout.next_seed(history)
                 log(f"topic chosen in {_dur(time.time() - started)}: {seed[:100]}")
         except Exception as exc:
+            if getattr(exc, "status_code", None) in (401, 403):
+                raise SystemExit(f"the provider refused the request ({exc}); rerun with another --provider or --model")
             log(f"seed selection failed ({type(exc).__name__}: {exc}); retrying in {args.pause}s")
             time.sleep(args.pause)
             continue
@@ -2206,6 +2224,11 @@ def _selftest() -> None:
     # publishing: only machine verdicts qualify, and a failed post is retried
     assert publishable({"status": "machine-verified"}) and publishable({"status": "refuted"})
     assert not any(publishable({"status": s}) for s in ("verified", "provisional", "known", "inconclusive"))
+    mixed = [{"status": "verified"}, {"status": "refuted"}]
+    assert publish_verdict(False, mixed, []).startswith("publish: OFF") and "1 result" in publish_verdict(False, mixed, [])
+    assert "NOTHING PUBLISHED" in publish_verdict(True, [{"status": "verified"}, {"status": "known"}], [])
+    assert "0/1 posted" in publish_verdict(True, mixed, [])
+    assert publish_verdict(True, mixed, [{"url": "u"}]) == "publish: 1 gist(s) posted"
     assert _counterexample_line("checks ok\nNO COUNTEREXAMPLE here\nCOUNTEREXAMPLE: n=7") == "COUNTEREXAMPLE: n=7"
     assert _counterexample_line("NO COUNTEREXAMPLE up to 10^6") == ""
     assert _gist_url("Creating gist\nhttps://gist.github.com/u/abc123\n") == "https://gist.github.com/u/abc123"
