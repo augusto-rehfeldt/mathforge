@@ -208,7 +208,59 @@ def _code_block(text: str) -> str:
     return (blocks[0] if blocks else text).strip()
 
 
-_PRINT_LOCK = threading.Lock()
+# reentrant: a print under the lock reaches _LiveStdout.write, which takes it again
+_PRINT_LOCK = threading.RLock()
+
+# On a terminal, running steps share one status line redrawn in place below the
+# log; piped to a file, heartbeats stay appended lines so the log keeps them.
+LIVE = sys.stdout.isatty()
+_live: dict = {}  # heartbeat token -> "c3 prove 2.1m"
+_live_width = 0
+_line_open = False  # someone else's output left a line unfinished (e.g. an input() prompt)
+
+
+def _live_draw(text: str) -> None:
+    """Overwrite the status line with `text` ("" clears it). Caller holds _PRINT_LOCK.
+    Plain \\r and spaces, no ANSI: a legacy Windows console prints escapes raw."""
+    global _live_width
+    if text and _line_open:
+        return  # drawing now would overwrite a half-written line
+    text = text[: shutil.get_terminal_size().columns - 1]
+    out = getattr(sys.stdout, "inner", sys.stdout)
+    out.write("\r" + " " * _live_width + "\r" + text)
+    out.flush()
+    _live_width = len(text)
+
+
+class _LiveStdout:
+    """sys.stdout on a terminal. Every write -- ours, ai_suite's retry notices,
+    anyone's print -- clears the status line first and redraws it after a newline,
+    so nothing lands on the status line's row.
+    ponytail: stdout only; a stderr traceback can still share the row."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def write(self, s: str) -> int:
+        global _line_open
+        with _PRINT_LOCK:
+            if _live_width:
+                _live_draw("")
+            n = self.inner.write(s)
+            if s:
+                _line_open = not s.endswith("\n")
+            if _live:
+                _live_draw("  |  ".join(_live.values()))
+            return n
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def _emit(text: str) -> None:
+    """One permanent line, serialized across workers."""
+    with _PRINT_LOCK:
+        print(text, flush=True)
 
 
 def log(msg: str, tag: str = "") -> None:
@@ -218,8 +270,7 @@ def log(msg: str, tag: str = "") -> None:
     line carries a clock and the conjecture it belongs to; without both, parallel
     output is unreadable and a long silence is indistinguishable from a hang.
     """
-    with _PRINT_LOCK:
-        print(f"{time.strftime('%H:%M:%S')}  {tag:<4} {msg}", flush=True)
+    _emit(f"{time.strftime('%H:%M:%S')}  {tag:<4} {msg}")
 
 
 # Compact by default: sub-step chatter only with --verbose (or MATHFORGE_VERBOSE=1).
@@ -237,9 +288,43 @@ def progress_bar(done: int, total: int, width: int = 20) -> str:
     return f"[{'#' * filled}{'.' * (width - filled)}] {done}/{total}"
 
 
+@contextlib.contextmanager
+def live_bar(label: str, total: int):
+    """Yields step() -> done count. On a terminal the bar leads the status line and
+    is redrawn in place on every step; piped, it draws nothing (callers log lines)."""
+    token, done = object(), [0]
+
+    def draw() -> None:
+        text = f"{label} {progress_bar(done[0], total)}".strip()
+        if token not in _live:  # first draw: put the bar ahead of running steps
+            rest = dict(_live)
+            _live.clear()
+            _live[token] = text
+            _live.update(rest)
+        _live[token] = text
+        _live_draw("  |  ".join(_live.values()))
+
+    def step() -> int:
+        with _PRINT_LOCK:
+            done[0] += 1
+            if LIVE:
+                draw()
+            return done[0]
+
+    if LIVE:
+        with _PRINT_LOCK:
+            draw()
+    try:
+        yield step
+    finally:
+        if LIVE:
+            with _PRINT_LOCK:
+                _live.pop(token, None)
+                _live_draw("  |  ".join(_live.values()))
+
+
 def rule(title: str = "") -> None:
-    with _PRINT_LOCK:
-        print(f"\n{('── ' + title + ' ').ljust(78, '─') if title else '─' * 78}\n", flush=True)
+    _emit(f"\n{('── ' + title + ' ').ljust(78, '─') if title else '─' * 78}\n")
 
 
 def _dur(seconds: float) -> str:
@@ -278,21 +363,35 @@ def heartbeat(label: str, tag: str = "", every: float = 0):
     """Tick while a step runs. A single model call can take minutes and prints
     nothing, which is indistinguishable from a hang; this says which step owns
     the silence and how long it has held it."""
-    # compact mode ticks five times less often; it still proves the run is alive
-    every = every or (HEARTBEAT if VERBOSE else 5 * HEARTBEAT)
+    # compact mode ticks five times less often; it still proves the run is alive.
+    # A live status line costs no scrollback, so it ticks every second.
+    live = LIVE
+    every = every or (1 if live else HEARTBEAT if VERBOSE else 5 * HEARTBEAT)
     stop = threading.Event()
+    token = object()
 
     def tick():
-        waited = 0
+        started = time.time()
         while not stop.wait(every):
-            waited += every
-            log(f"{label}: still running ({_dur(waited)})", tag)
+            waited = time.time() - started
+            if not live:
+                log(f"{label}: still running ({_dur(waited)})", tag)
+                continue
+            with _PRINT_LOCK:
+                if stop.is_set():  # the block ended while we waited for the lock
+                    break
+                _live[token] = f"{tag + ' ' if tag else ''}{label} {_dur(waited)}"
+                _live_draw("  |  ".join(_live.values()))
 
     threading.Thread(target=tick, daemon=True).start()
     try:
         yield
     finally:
         stop.set()
+        if live:
+            with _PRINT_LOCK:
+                if _live.pop(token, None) is not None:
+                    _live_draw("  |  ".join(_live.values()))
 
 
 class Run:
@@ -344,7 +443,7 @@ class Run:
         except Exception as exc:
             log(f"{name}: FAILED after {_dur(time.time() - started)} — {type(exc).__name__}: {exc}", _tag(key))
             raise
-        log(f"{name}: done in {_dur(time.time() - started)}", _tag(key))
+        vlog(f"{name}: done in {_dur(time.time() - started)}", _tag(key))
         with self.lock:
             self.data[key] = value
         self.save()
@@ -903,12 +1002,12 @@ class Forge:
             vlog(f"{label}, up to {LEAN_TIMEOUT if lang == 'lean' else CODE_TIMEOUT}s", tag)
             started = time.time()
             rc, out = runner(code)
-            log(f"  {step}: exit {rc} in {_dur(time.time() - started)} — {_verdict_line(out)}", tag)
+            vlog(f"  {step}: exit {rc} in {_dur(time.time() - started)} — {_verdict_line(out)}", tag)
             silent = bool(markers) and rc == 0 and not any(m in out for m in markers)
             if (rc == 0 and not silent) or attempt == MAX_CODE_REPAIRS:
                 return {"code": code, "exit_code": rc, "output": out, "repairs": attempt,
                         "model": self.models.get(model_type, "")}
-            log(f"  {step}: {'no verdict printed' if silent else f'failed (exit {rc})'}, asking for a repair", tag)
+            vlog(f"  {step}: {'no verdict printed' if silent else f'failed (exit {rc})'}, asking for a repair", tag)
             complaint = (
                 "ran but never printed a verdict line. It must print exactly one of: "
                 + " or ".join(f"`{m}`" for m in markers)
@@ -971,7 +1070,7 @@ class Forge:
                 raise ValueError(f"no statement in reply: {reply[:200]}")
             return found
         except Exception as exc:
-            log(f"proposer {nth}/{count} produced nothing: {type(exc).__name__}: {exc}")
+            vlog(f"proposer {nth}/{count} produced nothing: {type(exc).__name__}: {exc}")
             # an unusable reply must not stay cached, or every --resume would
             # re-read the same garbage instead of asking again
             with self.run.lock:
@@ -988,19 +1087,25 @@ class Forge:
         returns nothing at all -- losing the batch, and with it the run. Separate
         calls are short, run in parallel, and a failure costs one conjecture.
         """
-        def fan_out(nths):
+        def fan_out(nths, step):
+            def one(n):
+                c = self.propose_one(seed, n, count)
+                step()
+                return c
             if workers > 1:
                 with ThreadPoolExecutor(max_workers=min(workers, len(nths))) as pool:
-                    return list(pool.map(lambda n: self.propose_one(seed, n, count), nths))
-            return [self.propose_one(seed, n, count) for n in nths]
+                    return list(pool.map(one, nths))
+            return [one(n) for n in nths]
 
         nths = list(range(1, count + 1))
-        proposals = dict(zip(nths, fan_out(nths)))
+        with live_bar("proposing", count) as step:
+            proposals = dict(zip(nths, fan_out(nths, step)))
         # a garbled or truncated reply is often a one-off: ask those proposers once more
         failed = [n for n, c in proposals.items() if c is None]
         if failed:
-            log(f"asking {len(failed)} proposer(s) that produced nothing once more")
-            proposals.update(zip(failed, fan_out(failed)))
+            vlog(f"asking {len(failed)} proposer(s) that produced nothing once more")
+            with live_bar("re-proposing", len(failed)) as step:
+                proposals.update(zip(failed, fan_out(failed, step)))
 
         # independent proposers land on the same idea now and then
         conjectures, seen = [], set()
@@ -1126,10 +1231,10 @@ class Forge:
                 )["queries"]
                 queries = [str(q) for q in queries if str(q).strip()][:4] if isinstance(queries, list) else []
             except Exception as exc:
-                log(f"  novelty: query generation failed: {exc}", cid)
+                vlog(f"  novelty: query generation failed: {exc}", cid)
 
         found = literature(queries, tag=cid) if queries else {"hits": [], "errors": ["search disabled"]}
-        log(f"  novelty: {len(found['hits'])} hits, {len(found['errors'])} backend errors; judging", cid)
+        vlog(f"  novelty: {len(found['hits'])} hits, {len(found['errors'])} backend errors; judging", cid)
 
         def judge(hits: list, queries_run: list) -> dict:
             digest = (
@@ -1165,7 +1270,7 @@ class Forge:
         followups = verdict.get("followup_queries")
         followups = [str(q) for q in followups if q and str(q) not in queries][:3] if isinstance(followups, list) else []
         if self.search and verdict.get("verdict") == "UNCLEAR" and followups:
-            log("  novelty: UNCLEAR, second search round", cid)
+            vlog("  novelty: UNCLEAR, second search round", cid)
             more = literature(followups, tag=cid)
             queries = queries + followups
             found = {
@@ -1180,7 +1285,7 @@ class Forge:
         verdict["retrieved"] = found["hits"]
         verdict["search_errors"] = found["errors"]
         verdict["evidence_base"] = "memory-only" if not found["hits"] else "retrieval"
-        log(f"  novelty: {verdict.get('verdict')} after {rounds} round(s)", cid)
+        vlog(f"  novelty: {verdict.get('verdict')} after {rounds} round(s)", cid)
         return verdict
 
     def prove(self, c: dict, evidence: str) -> str:
@@ -1365,7 +1470,7 @@ def pipeline(forge: Forge, c: dict) -> dict:
     cid = c["id"]
     run = forge.run
     started = time.time()
-    log(f"{c.get('title', '(untitled)')}", cid)
+    vlog(f"{c.get('title', '(untitled)')}", cid)
     vlog(f"  claim: {str(c.get('statement', ''))[:150]}", cid)
 
     falsification = run.stage(f"{cid}.falsify", lambda: forge.falsify(c))
@@ -1376,7 +1481,7 @@ def pipeline(forge: Forge, c: dict) -> dict:
         extra = {}
         detail = _counterexample_line(falsification["output"]) or _verdict_line(falsification["output"])
         if search == "refuted":
-            log(f"  search reports a counterexample — {detail}", cid)
+            vlog(f"  search reports a counterexample — {detail}", cid)
             confirmation = run.stage(f"{cid}.confirm", lambda: forge.confirm_refutation(c, falsification["output"]))
             extra["confirmation"] = confirmation
             if not refutation_confirmed(confirmation):
@@ -1395,12 +1500,12 @@ def pipeline(forge: Forge, c: dict) -> dict:
                 extra["lean"] = lean
                 if lean.get("sorry_free") and faithful(lean):
                     status = "machine-refuted"
-                log(f"  lean refutation: {'sorry-free' if lean.get('sorry_free') else 'not checked'}, "
+                vlog(f"  lean refutation: {'sorry-free' if lean.get('sorry_free') else 'not checked'}, "
                     f"faithfulness={(lean.get('faithfulness') or {}).get('verdict', 'n/a')}", cid)
-        log(f"  {status.upper()} — {detail}", cid)
-        log(f"  finished as `{status}` in {_dur(time.time() - started)}", cid)
+        vlog(f"  {status.upper()} — {detail}", cid)
+        vlog(f"  finished as `{status}` in {_dur(time.time() - started)}", cid)
         return {**c, "status": status, "falsification": falsification, **extra}
-    log(f"  survived the search — {_verdict_line(falsification['output'])}", cid)
+    vlog(f"  survived the search — {_verdict_line(falsification['output'])}", cid)
 
     # a backend that failed (arXiv 406 throttling, OpenAlex 429) left the verdict
     # resting on partial retrieval: drop it so --resume searches again
@@ -1408,26 +1513,26 @@ def pipeline(forge: Forge, c: dict) -> dict:
         run.data.pop(f"{cid}.novelty", None)
     novelty = run.stage(f"{cid}.novelty", lambda: forge.novelty(c))
     if novelty.get("verdict") == "KNOWN":
-        log(f"  KNOWN — closest: {'; '.join(map(str, novelty.get('closest_known_results') or []))[:150]}", cid)
-        log(f"  finished as `known` in {_dur(time.time() - started)}", cid)
+        vlog(f"  KNOWN — closest: {'; '.join(map(str, novelty.get('closest_known_results') or []))[:150]}", cid)
+        vlog(f"  finished as `known` in {_dur(time.time() - started)}", cid)
         return {**c, "status": "known", "novelty": novelty, "falsification": falsification}
 
     proof = run.stage(f"{cid}.proof", lambda: forge.prove(c, falsification["output"]))
     if "## GAP" in proof:
-        log("  the prover declared a GAP in its own proof", cid)
+        vlog("  the prover declared a GAP in its own proof", cid)
     report = run.stage(f"{cid}.referee", lambda: forge.referee(c, proof))
-    log(f"  referee: {report.get('verdict')} — {str(report.get('summary', ''))[:120]}", cid)
+    vlog(f"  referee: {report.get('verdict')} — {str(report.get('summary', ''))[:120]}", cid)
     if report.get("verdict") != "VALID":
-        log("  sending it back for repair", cid)
+        vlog("  sending it back for repair", cid)
         proof = run.stage(f"{cid}.proof2", lambda: forge.repair(c, proof, report))
         report = run.stage(f"{cid}.referee2", lambda: forge.referee(c, proof))
-        log(f"  referee (round 2): {report.get('verdict')}", cid)
+        vlog(f"  referee (round 2): {report.get('verdict')}", cid)
 
     check = run.stage(f"{cid}.check", lambda: forge.independent_check(c, proof))
     passed = check_passed(check)
 
     if not forge.lean_project:
-        log("  lean: skipped (no Mathlib project)", cid)
+        vlog("  lean: skipped (no Mathlib project)", cid)
     lean = run.stage(f"{cid}.lean", lambda: forge.lean(c, proof)) if forge.lean_project else None
     # its own stage: a garbled faithfulness reply used to throw away a
     # fifteen-minute Lean run with it. Older runs cached it inside the Lean stage.
@@ -1454,9 +1559,9 @@ def pipeline(forge: Forge, c: dict) -> dict:
             state = "compiles+sorry"
         else:
             state = "failed to compile"
-        log(f"  lean: {state}, faithfulness={(lean.get('faithfulness') or {}).get('verdict', 'n/a')}", cid)
-    log(f"  independent check: {'passed' if passed else 'did not pass'}", cid)
-    log(f"  finished as `{status}` in {_dur(time.time() - started)}", cid)
+        vlog(f"  lean: {state}, faithfulness={(lean.get('faithfulness') or {}).get('verdict', 'n/a')}", cid)
+    vlog(f"  independent check: {'passed' if passed else 'did not pass'}", cid)
+    vlog(f"  finished as `{status}` in {_dur(time.time() - started)}", cid)
     return {
         **c,
         "status": status,
@@ -1481,7 +1586,7 @@ def run_one(forge: Forge, c: dict) -> dict:
         return pipeline(forge, c)
     except Exception as exc:
         log(f"  pipeline error — {type(exc).__name__}: {exc}", c["id"])
-        log("  finished as `error` (not cached; --resume retries it)", c["id"])
+        vlog("  finished as `error` (not cached; --resume retries it)", c["id"])
         return {**c, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -1829,29 +1934,28 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
     forge = forge_for(run)
 
     started = time.time()
-    rule(f"seed: {seed[:60]}")
-    log(f"run directory: {run.path}")
+    rule(seed[:74])
+    vlog(f"run directory: {run.path}")
     conjectures = run.stage("conjectures", lambda: forge.propose(seed, args.conjectures, args.workers))
     for c in conjectures:
         vlog(f"proposed: {c.get('title', '(untitled)')}", c["id"])
-    how = f"{args.workers} in parallel" if args.workers > 1 else "one at a time"
-    rule(f"{len(conjectures)} conjectures, {how}")
+    log(f"{len(conjectures)} conjectures")
 
-    finished = [0]
+    # On a terminal the bar leads the status line, redrawn in place; piped, it
+    # prefixes each result line so the log still shows progress.
+    with live_bar("", len(conjectures)) as step:
+        def one(c):
+            r = run_one(forge, c)
+            done = step()
+            bar = "" if LIVE else progress_bar(done, len(conjectures)) + " "
+            log(f"{bar}{r['status']:<16} {c.get('title', '')[:60]}", c["id"])
+            return r
 
-    def one(c):
-        r = run_one(forge, c)
-        with _PRINT_LOCK:
-            finished[0] += 1
-            done = finished[0]
-        log(f"{progress_bar(done, len(conjectures))} {r['status']}", c["id"])
-        return r
-
-    if args.workers > 1:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            results = list(pool.map(one, conjectures))
-    else:
-        results = [one(c) for c in conjectures]
+        if args.workers > 1:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                results = list(pool.map(one, conjectures))
+        else:
+            results = [one(c) for c in conjectures]
 
     run.data["results"] = results
     run.save()
@@ -1859,16 +1963,11 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
     tally = {}
     for r in results:
         tally[r["status"]] = tally.get(r["status"], 0) + 1
-    rule("results")
-    for status in ("machine-verified", "verified", "provisional", "known", "machine-refuted", "refuted",
-                   "inconclusive", "error"):
-        if tally.get(status):
-            log(f"{status:<17} {tally[status]}")
 
     keepers = [r for r in results if r["status"] in ("machine-verified", "verified", "provisional")]
     if len(keepers) < len(results):
         (run.path / "negative_results.md").write_text(negative_results(seed, results), encoding="utf-8")
-        log(f"negative results: {run.path / 'negative_results.md'}")
+        vlog(f"negative results: {run.path / 'negative_results.md'}")
 
     paper_path = None
     if keepers:
@@ -1886,9 +1985,12 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
     published = publish(run, seed, results) if getattr(args, "publish", False) else []
 
     elapsed = time.time() - started
-    log(f"paper: {paper_path}" if paper_path else "nothing survived; no paper written")
-    log(publish_verdict(getattr(args, "publish", False), results, published))
-    log(f"seed done in {_dur(elapsed)}: {seed[:60]}")
+    order = ("machine-verified", "verified", "provisional", "known", "machine-refuted", "refuted",
+             "inconclusive", "error")
+    log(f"done in {_dur(elapsed)}: " + ", ".join(f"{tally[k]} {k}" for k in order if tally.get(k)))
+    if paper_path:
+        log(f"paper: {paper_path}")
+    (log if getattr(args, "publish", False) else vlog)(publish_verdict(getattr(args, "publish", False), results, published))
 
     def _relative(p: Path | None) -> str | None:
         if p is None:
@@ -1978,6 +2080,8 @@ def main(argv=None) -> int:
 
     # stages are minutes apart; keep progress visible when piped to a log
     sys.stdout.reconfigure(line_buffering=True)
+    if LIVE:
+        sys.stdout = _LiveStdout(sys.stdout)
     # stop at once, not after the model call in flight; the cut stage is simply not cached
     exit_on_ctrl_c(message="stopped; every finished stage is cached on disk, --resume picks it up")
 
@@ -2028,17 +2132,16 @@ def main(argv=None) -> int:
     review_effort = args.review_effort or args.effort
     effort_supported = set_reasoning_effort(ai, args.effort, review_effort)
 
-    rule("mathforge")
     log(f"models      {args.model} (work) / {args.review_model} (review)")
     log(f"effort      {args.effort} (work) / {review_effort} (review)"
         f"{'' if effort_supported else ' -- unsupported by this provider'}, "
         f"{args.max_tokens} tokens/call requested")
     log(f"plan        {'forever' if args.forever else f'{args.runs} run(s)'}, "
         f"{args.conjectures} conjectures each, {args.workers} worker(s)")
-    log(f"lean        {lean_project or ('disabled (--no-lean)' if args.no_lean else 'no Mathlib project found; run --setup-lean')}")
-    log(f"novelty     {'arXiv + Crossref + OpenAlex' + (' + Semantic Scholar' if os.getenv('S2_API_KEY') else '') if not args.no_search else 'disabled (--no-search)'}")
-    log(f"publish     {'PUBLIC gists for machine-verified results and counterexamples' if args.publish else 'off'}")
-    log(f"library     {OUTPUT_ROOT}")
+    vlog(f"lean        {lean_project or ('disabled (--no-lean)' if args.no_lean else 'no Mathlib project found; run --setup-lean')}")
+    vlog(f"novelty     {'arXiv + Crossref + OpenAlex' + (' + Semantic Scholar' if os.getenv('S2_API_KEY') else '') if not args.no_search else 'disabled (--no-search)'}")
+    vlog(f"publish     {'PUBLIC gists for machine-verified results and counterexamples' if args.publish else 'off'}")
+    vlog(f"library     {OUTPUT_ROOT}")
 
     def forge_for(run: Run) -> Forge:
         return Forge(ai, run, lean_project, search=not args.no_search)
@@ -2069,10 +2172,10 @@ def main(argv=None) -> int:
         except Exception:
             history = []
 
-    log(f"history     {len(history)} previous run(s) on record")
+    vlog(f"history     {len(history)} previous run(s) on record")
     scout = forge_for(Run(OUTPUT_ROOT / "_scout"))
     _drive(scout, forge_for, args, history)
-    log(f"library index: {OUTPUT_ROOT / 'index.md'}")
+    vlog(f"library index: {OUTPUT_ROOT / 'index.md'}")
     return 0
 
 
@@ -2084,10 +2187,10 @@ def _drive(scout: Forge, forge_for, args, history: list) -> int:
                 seed = args.seed
             else:
                 started = time.time()
-                log("choosing the next topic (asking the review model)...")
+                vlog("choosing the next topic (asking the review model)...")
                 with heartbeat("next topic"):
                     seed = scout.next_seed(history)
-                log(f"topic chosen in {_dur(time.time() - started)}: {seed[:100]}")
+                vlog(f"topic chosen in {_dur(time.time() - started)}")
         except Exception as exc:
             if getattr(exc, "status_code", None) in (401, 403):
                 raise SystemExit(f"the provider refused the request ({exc}); rerun with another --provider or --model")
@@ -2105,7 +2208,7 @@ def _drive(scout: Forge, forge_for, args, history: list) -> int:
             history.append({"seed": seed, "tally": {"failed": 1}})
         completed += 1
         if (args.forever or completed < args.runs) and args.pause:
-            rule(f"{completed} run(s) done; next in {args.pause}s (Ctrl-C to stop)")
+            vlog(f"{completed} run(s) done; next in {args.pause}s (Ctrl-C to stop)")
             time.sleep(args.pause)
     return completed
 
@@ -2524,17 +2627,61 @@ def _selftest() -> None:
     assert _verdict_line("x" * 200).endswith("x") and len(_verdict_line("x" * 200)) == 88
 
     ticks = []
-    real_log = globals()["log"]
+    real_log, real_live = globals()["log"], LIVE
     globals()["log"] = lambda msg, tag="": ticks.append(msg)
+    globals()["LIVE"] = False  # piped: heartbeats are appended log lines
     try:
         with heartbeat("slow", every=0.05):
             time.sleep(0.2)
         quiet_after_exit = len(ticks)
         time.sleep(0.15)  # the ticker must stop with the block, not outlive it
     finally:
-        globals()["log"] = real_log
+        globals()["log"], globals()["LIVE"] = real_log, real_live
     assert ticks and "still running" in ticks[0], ticks
     assert len(ticks) == quiet_after_exit, ticks
+
+    # terminal: heartbeats redraw one status line, and leave nothing behind
+    import io
+    screen = io.StringIO()
+    globals()["LIVE"] = True
+    try:
+        with contextlib.redirect_stdout(_LiveStdout(screen)):
+            with heartbeat("prove", "c4", every=0.05):
+                time.sleep(0.2)
+                seen = dict(_live)
+                log("result line", "c4")
+                print("[opencode] retry notice")  # foreign output, as ai_suite prints it
+                shown = screen.getvalue()
+                print("Enter key: ", end="")  # an open prompt: the ticker must not draw over it
+                before = screen.getvalue()
+                time.sleep(0.15)
+                assert screen.getvalue() == before, screen.getvalue()[len(before):]
+                print()
+    finally:
+        globals()["LIVE"] = real_live
+    assert list(seen.values())[0].startswith("c4 prove "), seen
+    assert not _live, _live
+    # each permanent line starts clean: the status line was wiped before it
+    for line in ("result line", "[opencode] retry notice"):
+        head = shown.split(line)[0].rsplit("\n", 1)[-1].rsplit("\r", 1)[-1]  # what the row shows
+        assert "prove" not in head, repr(head)
+    assert "c4 prove" in shown.rsplit("\n", 1)[-1], repr(shown[-60:])  # redrawn below it
+
+    # live_bar: leads the status line, redrawn in place per step, gone at the end
+    screen = io.StringIO()
+    globals()["LIVE"] = True
+    try:
+        with contextlib.redirect_stdout(_LiveStdout(screen)):
+            _live["other"] = "conjectures 3s"
+            with live_bar("proposing", 2) as step:
+                assert list(_live.values())[0] == "proposing [....................] 0/2", _live
+                assert step() == 1
+                assert list(_live.values())[0].endswith("1/2"), _live
+            assert list(_live.values()) == ["conjectures 3s"], _live
+            _live.pop("other")
+    finally:
+        globals()["LIVE"] = real_live
+    assert "\n" not in screen.getvalue(), repr(screen.getvalue())  # all in place, no new lines
 
     # publishing: only machine verdicts qualify, and a failed post is retried
     assert publishable({"status": "machine-verified"}) and publishable({"status": "machine-refuted"})

@@ -6,6 +6,7 @@ interactive provider/model picker (book writer, mathforge, music writer, ...).""
 from __future__ import annotations
 
 import colorsys
+import contextlib
 import json
 import math
 import os
@@ -446,6 +447,13 @@ def _save_last_provider(provider: str, openai_model: str | None = None,
 
 def _prompt_provider(default_provider: str) -> str:
     valid_providers = list(PROVIDER_CONFIG_MAP.keys())
+    width = max(map(len, valid_providers))
+    default_tag = "  " + _color("default", "2")
+    picked = _arrow_menu("Provider", [
+        (p, f"{p:<{width}}  {PROVIDER_LABELS.get(p, '')}{default_tag if p == default_provider else ''}")
+        for p in valid_providers], default_provider)
+    if picked is not None:
+        return picked
     prompt = f"Choose provider ({', '.join(valid_providers)}) [default: {default_provider}]: "
 
     while True:
@@ -506,87 +514,137 @@ def _prompt_openai_model(
         # The OAuth endpoint's own figures win over models.dev when it reports them.
         reported = {k: v for k, v in (("context", context), ("output", output)) if v}
         rows.append((model, {**info, "limit": {**(info.get("limit") or {}), **reported}}))
-    title = "Available OpenAI OAuth text models (live):" if model_info is not None else "Available OpenAI models:"
+    title = "OpenAI via ChatGPT sign-in (live)" if model_info is not None else "OpenAI"
     paid_by = "; your ChatGPT subscription pays" if model_info is not None else ""
     return _pick_model(title, rows, default_model, role, paid_by,
                        None if model_info is not None else _normalize_openai_model)
 
 
-def _read_choice(prompt: str, on_tab) -> str:
-    """input(), except on a Windows console Tab calls on_tab() and keeps reading."""
-    if os.name != "nt" or not sys.stdin.isatty():
-        # ponytail: no Tab re-sort off Windows; termios raw mode if that's ever needed.
-        return input(prompt)
+MENU_ROWS = 20  # rows on screen at once; the rest scroll
+
+
+@contextlib.contextmanager
+def _loading(what: str):
+    """"Loading <what>..." on a terminal while the block runs, erased when it ends."""
+    tty = sys.stdout.isatty()
+    if tty:
+        print(_color(f"Loading {what}...", "2"), end="", flush=True)
+    try:
+        yield
+    finally:
+        if tty:
+            print("\r\033[K", end="", flush=True)
+
+
+def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: str = "",
+                sorts: list[tuple[str, list[str]]] | None = None, name: str = "") -> str | None:
+    """Arrow-key menu on a Windows console, MENU_ROWS rows at a time.
+
+    Up/Down (or W/S)/PgUp/PgDn/Home/End move, Space selects or deselects the row under the
+    cursor, Enter confirms the selection (the cursor row when nothing is selected),
+    Esc keeps the default, Tab cycles `sorts` [(name, ids in order)]. Opens with the
+    default selected. On confirm the menu collapses to one "<name>: <pick>" line.
+    Returns None off a console so callers fall back to typing.
+    """
+    if os.name != "nt" or not sys.stdin.isatty() or not sys.stdout.isatty():
+        # ponytail: Windows console only; termios raw mode if that's ever needed.
+        return None
     import msvcrt
-    typed = ""
-    print(prompt, end="", flush=True)
+    text = dict(rows)
+    sorts = sorts or [("", [rid for rid, _ in rows])]
+    sort = 0
+    selected = default if default in text else None
+    cur = sorts[0][1].index(selected) if selected else 0
+    top = drawn = 0
+    os.system("")  # ANSI cursor codes on the Windows console
+    keys = "↑↓/W S move · Space select · Enter confirm · Esc default"
+    if len(sorts) > 1:
+        keys += " · Tab sort"
+
+    def redraw(lines: list[str]) -> None:
+        nonlocal drawn
+        # Back to the title line, clear everything below it, draw again.
+        print((f"\033[{drawn}A" if drawn else "") + "\r\033[J" + "\n".join(lines), flush=True)
+        drawn = len(lines)
+
+    def done(picked: str) -> str:
+        redraw([f"{_color('✓', '32')} {name or title.rstrip(':')}: {_color(picked, '1')}"])
+        return picked
+
     while True:
+        order = sorts[sort][1]
+        top = min(max(top, cur - MENU_ROWS + 1), cur)
+        shown = order[top:top + MENU_ROWS]
+        sorted_by = f"  sorted by {sorts[sort][0]}" if len(sorts) > 1 else ""
+        lines = [_color(title, "1") + _color(sorted_by, "2")]
+        for i, rid in enumerate(shown):
+            row = f"[{'x' if rid == selected else ' '}] {text[rid]}"
+            lines.append(_color(f"  > {row}", "1;36") if top + i == cur else f"    {row}")
+        scroll = f"{top + 1}-{top + len(shown)} of {len(order)}"
+        lines.append(_color(f"    {scroll} · {keys}", "2"))
+        lines += [_color(line, "2") for line in footer.splitlines()]
+        redraw(lines)
         ch = msvcrt.getwch()
-        if ch in "\r\n":
-            print()
-            return typed
-        if ch == "\t":
-            on_tab()
-            print(prompt + typed, end="", flush=True)
+        if ch in "\x00\xe0":  # arrow/function key: the second half says which
+            step = {"H": -1, "P": 1, "I": -MENU_ROWS, "Q": MENU_ROWS,
+                    "G": -len(order), "O": len(order)}.get(msvcrt.getwch(), 0)
+            cur = min(max(cur + step, 0), len(order) - 1)
+        elif ch in "wWsS":
+            cur = min(max(cur + (-1 if ch in "wW" else 1), 0), len(order) - 1)
+        elif ch == " ":
+            selected = None if selected == order[cur] else order[cur]
+        elif ch in "\r\n":
+            return done(selected or order[cur])
+        elif ch == "\t" and len(sorts) > 1:
+            sort = (sort + 1) % len(sorts)
+            cur = sorts[sort][1].index(order[cur])
+        elif ch in "\x1b\x1a":
+            return done(default)
         elif ch == "\x03":
             raise KeyboardInterrupt
-        elif ch == "\x1a":
-            raise EOFError
-        elif ch == "\x08":
-            if typed:
-                typed = typed[:-1]
-                print("\b \b", end="", flush=True)
-        elif ch in "\x00\xe0":
-            msvcrt.getwch()  # arrow/function key: second half of its code
-        elif ch.isprintable():
-            typed += ch
-            print(ch, end="", flush=True)
 
 
 def _pick_model(title: str, rows: list[tuple[str, dict]], default_model: str, role: str,
                 paid_by: str, normalize=None) -> str:
-    """Numbered model menu; Tab re-sorts it by the next of SORT_KEYS, best first."""
+    """Arrow-key model menu (`_arrow_menu`), cheapest first; Tab re-sorts by the next
+    of SORT_KEYS, best first. Off a console: numbered list, number or id typed."""
     ids = [mid for mid, _ in sorted(rows, key=lambda row: _cost_key(row[1]))]
     infos = dict(rows)
     scales = dict(zip(infos, _scales(list(infos.values()))))
     width = max(map(len, ids))
-    state = {"sort": 0, "order": ids, "below": 0}
+    default_tag = "  " + _color("default", "2")
+    label = {mid: f"{mid:<{width}}  {_facts_label(infos[mid], scales[mid])}"
+                  f"{default_tag if mid == default_model else ''}" for mid in ids}
+    # Stable over the price order, so ties stay cheapest first; unknowns go last.
+    sorts = [(name, sorted(ids, key=lambda mid: -scales[mid].get(key, -1)))
+             for key, name in SORT_KEYS.items()]
+    legend = f"    $ = API list price per 1M in/out tokens{paid_by}; -> = aggregate score 0-100."
+    name = f"{role.capitalize()} model" if role else "Model"
+    heading = f"{name} · {title}"
+    picked = _arrow_menu(heading, [(mid, label[mid]) for mid in ids], default_model, legend, sorts,
+                         name=name)
+    if picked is not None:
+        return picked
 
-    def render() -> None:
-        key = list(SORT_KEYS)[state["sort"]]
-        # Stable over the price order, so ties stay cheapest first; unknowns go last.
-        state["order"] = sorted(ids, key=lambda mid: -scales[mid].get(key, -1))
-        print(f"{title}  [sorted by {SORT_KEYS[key]}; Tab: next]")
-        for i, mid in enumerate(state["order"], 1):
-            marker = " (default)" if mid == default_model else ""
-            print(f"  {i:2d}. {mid:<{width}}  {_facts_label(infos[mid], scales[mid])}{marker}")
-        print(f"  $ = API list price per 1M in/out tokens{paid_by}; -> = aggregate score 0-100.")
-
-    def next_sort() -> None:
-        state["sort"] = (state["sort"] + 1) % len(SORT_KEYS)
-        # Back to the title line, clear everything below it, draw again.
-        print(f"\r\033[{len(ids) + 2 + state['below']}A\033[J", end="")
-        state["below"] = 0
-        render()
-
-    os.system("")  # ANSI cursor codes on the Windows console
-    render()
+    order = sorts[0][1]
+    print(heading)
+    for i, mid in enumerate(order, 1):
+        print(f"  {i:2d}. {label[mid]}")
+    print(legend)
     prompt = f"Choose {role + ' ' if role else ''}model number or id [default: {default_model}]: "
     while True:
         try:
-            choice = _read_choice(prompt, next_sort).strip()
+            choice = input(prompt).strip()
         except EOFError:
             return default_model
         if not choice:
             return default_model
-        order = state["order"]
         if choice.isdigit() and 1 <= int(choice) <= len(order):
             return order[int(choice) - 1]
         for model in (choice.lower(), normalize(choice) if normalize else None):
             if model in infos:
                 return model
         print(f"Choose a number from 1 to {len(order)} or a listed model id.")
-        state["below"] += 2  # the answered prompt line and this one
 
 
 def _default_catalogue_model(provider: str) -> str:
@@ -616,6 +674,13 @@ def _load_last_catalogue_model(provider: str, default_model: str | None = None,
 
 
 PROVIDER_LABELS = {
+    "google": "Google Gemini API",
+    "openai": "OpenAI API",
+    "openai-oauth": "OpenAI via ChatGPT sign-in (your subscription)",
+    "groq": "Groq",
+    "minimax": "MiniMax",
+    "openrouter": "OpenRouter",
+    "nvidia": "NVIDIA NIM",
     "opencode-go": "OpenCode Go",
     "opencode-zen": "OpenCode Zen (through the OpenCode CLI)",
     "claude": "Claude Code (your subscription, no API key)",
@@ -630,7 +695,7 @@ def _prompt_catalogue_model(provider: str, default_model: str, role: str = "") -
     label = PROVIDER_LABELS.get(provider, provider)
     rows = [(mid, _model_facts(provider, mid)) for mid in models]
     paid_by = "; your subscription pays" if provider in SUBSCRIPTION_PROVIDERS else ""
-    return _pick_model(f"Available {label} models:", rows, default_model, role, paid_by)
+    return _pick_model(label, rows, default_model, role, paid_by)
 
 
 
@@ -677,14 +742,23 @@ def choose_ai(
     models: list[str] = []
     state_keys: list[str] = []
     label = lambda role: role if len(roles) > 1 else ""
+    if mode != "auto" and (provider in CATALOGUE_PROVIDERS or provider in ("openai", "openai-oauth")):
+        # The live catalogue, models.dev and Artificial Analysis are all fetched (and
+        # cached) before the first menu can draw; say so instead of sitting silent.
+        with _loading(f"{PROVIDER_LABELS.get(provider, provider)} models"):
+            if provider in CATALOGUE_PROVIDERS:
+                _provider_models(provider)
+            _models_dev()
+            _artificial_analysis()
     if provider in ("openai", "openai-oauth"):
-        model_info = _load_openai_oauth_models() if provider == "openai-oauth" else None
+        with _loading("OpenAI models"):
+            model_info = _load_openai_oauth_models() if provider == "openai-oauth" else None
         options = tuple(model_info) if model_info is not None else OPENAI_MODEL_OPTIONS
         base_key = "openai_oauth_model" if provider == "openai-oauth" else "openai_model"
         for i, role in enumerate(roles):
             key = base_key if i == 0 else f"{base_key}_{role}"
             fallback = defaults[i] if i < len(defaults) else (
-                "gpt-5.6-terra" if provider == "openai-oauth" else None)
+                "gpt-6-sol" if provider == "openai-oauth" else None)
             default_model = _load_last_openai_model(fallback, options, key, state_file)
             models.append(default_model if mode == "auto"
                           else _prompt_openai_model(default_model, model_info, label(role)))
