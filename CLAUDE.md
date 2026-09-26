@@ -151,7 +151,7 @@ Without `--config`, provider and models come from the shared menu
 (`ai_suite.choose_ai`, roles work + review, live model list). It asks
 on a terminal and reuses the last pick otherwise; picks are remembered in
 `math_output/provider_state.json`, first defaults opencode-go with
-deepseek-v4-pro / deepseek-v4-flash. `--provider` skips the provider question;
+deepseek-v4-pro / deepseek-v4.1-flash. `--provider` skips the provider question;
 `--model` / `--review-model` still win over the menu.
 
 Any ai-suite provider config works, so OpenAI models are reachable two ways:
@@ -159,12 +159,12 @@ Any ai-suite provider config works, so OpenAI models are reachable two ways:
 key) or `ai_config_openai_oauth.json` (ChatGPT sign-in — `AIService.__init__`
 starts `npx openai-oauth` on `127.0.0.1:10531` and opens a browser the first
 time). `--model` / `--review-model` override whatever model ids the config
-names. The two routes do not serve the same catalogue: the oauth proxy lists
-`gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4-mini`; `gpt-5.6-sol` exists
-only on the API-key route, so a Sol+Luna pairing has to go through
-`ai_config_openai.local.json`. That config's `openai_daily_token_limits` bucket
-every model outside `openai_big_models` as `mini`, so the gpt-5.6 pair currently
-draws on the 2.5M/day mini budget.
+names. The oauth proxy's catalogue is live (checked 2026-09-26: `gpt-6-sol`,
+`gpt-6-luna`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`,
+`gpt-5.5`), and ai-suite's oauth default is `gpt-6-sol`, so a Sol+Luna pairing
+no longer needs the API-key route. On `ai_config_openai.local.json`,
+`openai_daily_token_limits` buckets every model outside `openai_big_models` as
+`mini` (the 2.5M/day budget).
 
 **Provider quirk worth knowing**: the opencode proxy ignores the requested
 completion-token cap, so `--max-tokens` is advisory there. Reasoning effort is

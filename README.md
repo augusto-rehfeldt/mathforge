@@ -53,6 +53,12 @@ python mathforge.py --forever --publish        # public gist per machine-checked
 python mathforge.py --selftest                 # offline, no API calls
 ```
 
+Other flags: `--verbose` logs every search query, code attempt and stage start;
+`--no-search` skips the arXiv/Crossref/OpenAlex novelty search; `--no-lean` runs
+without Lean (nothing becomes machine-checked or publishable); `--config <json>`
+uses an ai-suite config directly and skips the provider menu. `--effort`,
+`--review-effort` and `--max-tokens` tune each call (`--help` has the details).
+
 Each run writes `math_output/<slug>/`: `state.json` (every stage, resumable),
 the generated scripts, `paper.md`, and `negative_results.md`. Runs are appended
 to `math_output/index.md`.
@@ -104,7 +110,7 @@ Credentials are read from the opencode CLI's own `auth.json`, so
 `opencode auth login` is the only setup.
 
 ```bash
-python mathforge.py "topic" --model deepseek-v4-pro --review-model deepseek-v4-flash
+python mathforge.py "topic" --model deepseek-v4-pro --review-model deepseek-v4.1-flash
 ```
 
 Optional environment: `S2_API_KEY` adds Semantic Scholar to the novelty search,

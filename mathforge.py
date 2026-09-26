@@ -97,7 +97,7 @@ ELAN_BIN = Path(os.getenv("ELAN_HOME") or Path.home() / ".elan") / "bin"
 # opencode models. Pro does the proposing, proving and formalizing; flash is the
 # referee, where throughput matters more than depth.
 DEFAULT_MODEL = "deepseek-v4-pro"
-DEFAULT_REVIEW_MODEL = "deepseek-v4-flash"
+DEFAULT_REVIEW_MODEL = "deepseek-v4.1-flash"
 # The shared AIService defaults to 4096/2048 completion tokens, sized for prose;
 # every stage here (proofs, Lean files, papers) is longer than a chapter. Note
 # that the opencode proxy IGNORES the requested cap -- measured: a request
