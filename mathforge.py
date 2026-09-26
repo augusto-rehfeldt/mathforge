@@ -713,7 +713,9 @@ def _axiom_probe(code: str) -> str:
     """
     # ponytail: parsed names, not Lean's own environment walk (a `run_cmd` over
     # `getEnv`); switch to that once it can be tested against a real Lean install
-    return "".join(f"\n#print axioms {n}" for n in _theorems(code)[0])
+    # pp.fullNames: under `open Classical` Lean prints `choice`, not the standard
+    # `Classical.choice`, and a sorry-free proof read as resting on a foreign axiom
+    return "".join(f"\nset_option pp.fullNames true in\n#print axioms {n}" for n in _theorems(code)[0])
 
 
 def _run_lean_probed(code: str, project: Path, workdir: Path, name: str):
@@ -1444,6 +1446,8 @@ def pipeline(forge: Forge, c: dict) -> dict:
     if lean:
         if lean["sorry_free"]:
             state = "sorry-free"
+        elif lean["compiles"] and "sorryAx" in (lean.get("unexpected_axioms") or []):
+            state = "compiles+sorry"   # Lean reports a sorry as the sorryAx axiom
         elif lean["compiles"] and (lean.get("axioms") or lean.get("unexpected_axioms")):
             state = "compiles+axiom"
         elif lean["compiles"]:
@@ -2157,7 +2161,8 @@ def _selftest() -> None:
     assert not lean_verdict("theorem t : True := trivial", 0, "")["sorry_free"]
     probe = _axiom_probe("namespace A\ntheorem t : True := trivial\nend A\n"
                          "@[simp] private lemma u : True := trivial\ntheorem _root_.v : True := trivial")
-    assert probe == "\n#print axioms A.t\n#print axioms u\n#print axioms v", probe
+    full = "\nset_option pp.fullNames true in\n#print axioms "
+    assert probe == f"{full}A.t{full}u{full}v", probe
     # the shapes the re-review broke the first probe with
     tricky = ("/- a comment:\n  lemma 2 gives the bound\n  theorem statement: x -/\n"
               "theorem «my thm» : True := trivial\ntheorem main.{u} : True := trivial\n"
