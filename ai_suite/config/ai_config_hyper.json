@@ -1,0 +1,74 @@
+{
+  "provider": "hyper",
+  "use_openai_client": true,
+  "writing_model": "deepseek-v4-pro-0813",
+  "review_model": "qwen3.8-max",
+  "base_url": "https://hyper.charm.land/v1",
+  "api_key_env": "HYPER_API_KEY",
+  "usage_state_path": "book_output/ai_usage_state.json",
+  "timeout": 900,
+  "min_book_pages": 250,
+  "min_chapter_words": 1200,
+  "writing_completion_tokens": 32768,
+  "review_completion_tokens": 16384,
+  "planning_completion_tokens": 8192,
+  "default_completion_tokens": 16384,
+  "humanize_rounds": 2,
+  "humanize_threshold": 15.0,
+  "judge_models": [
+    "glm-5.2",
+    "glm-5.3-flash",
+    "kimi-k3",
+    "minimax-m3"
+  ],
+  "models": {
+    "deepseek-v4-pro": {
+      "name": "DeepSeek V4 Pro",
+      "max_output": 384000
+    },
+    "deepseek-v4-pro-0813": {
+      "name": "DeepSeek V4 Pro 0813",
+      "max_output": 262144
+    },
+    "deepseek-v4.1-flash": {
+      "name": "DeepSeek V4.1 Flash",
+      "max_output": 32768
+    },
+    "glm-5.3": {
+      "name": "GLM 5.3",
+      "max_output": 128000
+    },
+    "glm-5.3-flash": {
+      "name": "GLM 5.3 Flash",
+      "max_output": 131072
+    },
+    "glm-5.2": {
+      "name": "GLM-5.2",
+      "max_output": 32768
+    },
+    "kimi-k3": {
+      "name": "Kimi K3",
+      "max_output": 16000
+    },
+    "minimax-m3": {
+      "name": "MiniMax M3",
+      "max_output": 512000
+    },
+    "qwen3.8-max": {
+      "name": "Qwen 3.8 Max",
+      "max_output": 65536
+    },
+    "qwen3.8-2.4t-a95b": {
+      "name": "Qwen 3.8 2.4T A95B",
+      "max_output": 128000
+    },
+    "qwen3.7-max": {
+      "name": "Qwen 3.7 Max",
+      "max_output": 64000
+    },
+    "inkling": {
+      "name": "Inkling",
+      "max_output": 32768
+    }
+  }
+}

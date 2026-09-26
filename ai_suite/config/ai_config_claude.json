@@ -1,0 +1,16 @@
+{
+  "provider": "claude",
+  "writing_model": "opus",
+  "review_model": "sonnet",
+  "timeout": 1800,
+  "min_book_pages": 250,
+  "min_chapter_words": 1200,
+  "humanize_rounds": 2,
+  "humanize_threshold": 15.0,
+  "judge_models": [],
+  "models": {
+    "opus": { "name": "Claude Opus (CLI)", "max_output": 0 },
+    "sonnet": { "name": "Claude Sonnet (CLI)", "max_output": 0 },
+    "haiku": { "name": "Claude Haiku (CLI)", "max_output": 0 }
+  }
+}

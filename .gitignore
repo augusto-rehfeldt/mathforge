@@ -2,3 +2,4 @@
 math_output/
 __pycache__/
 *.pyc
+.env

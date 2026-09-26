@@ -7,9 +7,9 @@ attack the proof, re-verifies the proof's own lemmas with a second script writte
 from the statement alone, formalizes the result in Lean 4 against Mathlib, and
 emits a paper. Runs one seed or churns out papers continuously.
 
-Credentials and model access are reused verbatim from the "book writer" project
-(ai_book_creator.services.ai_service.AIService), which reads the opencode CLI's
-auth.json, so no new key handling lives here.
+Credentials and model access are reused verbatim from the shared ai-suite package
+(ai_suite.AIService), which reads the opencode CLI's auth.json, so no new key
+handling lives here.
 
 SECURITY: every agent-written script is executed with subprocess. That is
 arbitrary code execution on this machine. Scripts run inside the per-run output
@@ -68,19 +68,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# The AI client, opencode credential loading and usage accounting are reused from
-# the sibling "book writer" project rather than reimplemented. Override the
-# location with MATHFORGE_BOOK_WRITER when it lives elsewhere.
-BOOK_WRITER = Path(os.getenv("MATHFORGE_BOOK_WRITER") or HERE.parent / "book writer")
-sys.path.insert(0, str(BOOK_WRITER))
+# The AI client, opencode credential loading and usage accounting are the shared
+# ai-suite package: the sibling checkout when present (AI_SUITE_DIR overrides the
+# location), else the copy vendored into this repository.
+AI_SUITE = Path(os.getenv("AI_SUITE_DIR") or HERE.parent / "ai-suite")
+if AI_SUITE.is_dir():
+    sys.path.insert(0, str(AI_SUITE))
 
 try:
-    from ai_book_creator.env import exit_on_ctrl_c, load_local_env  # noqa: E402
-    from ai_book_creator.services.ai_service import AIService  # noqa: E402
+    from ai_suite import AIService, choose_ai, exit_on_ctrl_c, load_local_env  # noqa: E402
 except ImportError as exc:  # pragma: no cover - configuration error, not logic
     raise SystemExit(
-        f"cannot import the book writer AI service from {BOOK_WRITER}\n"
-        "set MATHFORGE_BOOK_WRITER to that project's directory."
+        f"cannot import the shared ai_suite package (looked in {AI_SUITE} and {HERE})\n"
+        "set AI_SUITE_DIR to the ai-suite checkout."
     ) from exc
 
 OUTPUT_ROOT = Path(os.getenv("MATHFORGE_OUTPUT") or HERE / "math_output")
@@ -88,6 +88,7 @@ CODE_TIMEOUT = 300
 HEARTBEAT = 60  # seconds between "still running" lines on a long stage
 LEAN_TIMEOUT = 900
 MAX_CODE_REPAIRS = 3
+MAX_JSON_RETRIES = 3  # re-asks after a reply with no usable JSON, before the stage errors
 DEFAULT_LEAN_PROJECT = Path.home() / "mathforge-lean"
 # written by setup_lean once `lake build` succeeds; a project without it is a
 # half-finished setup, and the next run resumes it instead of using it
@@ -97,7 +98,7 @@ ELAN_BIN = Path(os.getenv("ELAN_HOME") or Path.home() / ".elan") / "bin"
 # referee, where throughput matters more than depth.
 DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_REVIEW_MODEL = "deepseek-v4-flash"
-# The book writer defaults to 4096/2048 completion tokens, sized for prose;
+# The shared AIService defaults to 4096/2048 completion tokens, sized for prose;
 # every stage here (proofs, Lean files, papers) is longer than a chapter. Note
 # that the opencode proxy IGNORES the requested cap -- measured: a request
 # capped at 800 came back with 4304 completion tokens -- so on that provider
@@ -221,6 +222,21 @@ def log(msg: str, tag: str = "") -> None:
         print(f"{time.strftime('%H:%M:%S')}  {tag:<4} {msg}", flush=True)
 
 
+# Compact by default: sub-step chatter only with --verbose (or MATHFORGE_VERBOSE=1).
+VERBOSE = os.getenv("MATHFORGE_VERBOSE", "") == "1"
+
+
+def vlog(msg: str, tag: str = "") -> None:
+    """A log line only --verbose wants: per-query, per-attempt, stage start/cached."""
+    if VERBOSE:
+        log(msg, tag)
+
+
+def progress_bar(done: int, total: int, width: int = 20) -> str:
+    filled = width * done // max(1, total)
+    return f"[{'#' * filled}{'.' * (width - filled)}] {done}/{total}"
+
+
 def rule(title: str = "") -> None:
     with _PRINT_LOCK:
         print(f"\n{('── ' + title + ' ').ljust(78, '─') if title else '─' * 78}\n", flush=True)
@@ -258,10 +274,12 @@ def _tag(key: str) -> str:
 
 
 @contextlib.contextmanager
-def heartbeat(label: str, tag: str = "", every: int = HEARTBEAT):
+def heartbeat(label: str, tag: str = "", every: float = 0):
     """Tick while a step runs. A single model call can take minutes and prints
     nothing, which is indistinguishable from a hang; this says which step owns
     the silence and how long it has held it."""
+    # compact mode ticks five times less often; it still proves the run is alive
+    every = every or (HEARTBEAT if VERBOSE else 5 * HEARTBEAT)
     stop = threading.Event()
 
     def tick():
@@ -316,10 +334,10 @@ class Run:
         """
         name = key.split(".", 1)[-1]
         if key in self.data:
-            log(f"{name}: cached", _tag(key))
+            vlog(f"{name}: cached", _tag(key))
             return self.data[key]
         started = time.time()
-        log(f"{name}: start", _tag(key))
+        vlog(f"{name}: start", _tag(key))
         try:
             with heartbeat(name, _tag(key)):
                 value = produce()
@@ -540,7 +558,7 @@ def literature(queries: list, rows: int = SEARCH_ROWS, tag: str = "") -> dict:
     """
     hits, errors, seen = [], [], set()
     for i, query in enumerate(queries, 1):
-        log(f'  search {i}/{len(queries)}: "{query[:70]}"', tag)
+        vlog(f'  search {i}/{len(queries)}: "{query[:70]}"', tag)
         for backend, delay in _backends():
             if delay:
                 _LIMITERS.setdefault(backend.__name__, _RateLimiter(delay)).wait()
@@ -548,7 +566,7 @@ def literature(queries: list, rows: int = SEARCH_ROWS, tag: str = "") -> dict:
                 found = backend(query, rows)
             except Exception as exc:  # network, XML, JSON, rate limit
                 errors.append(f"{backend.__name__}('{query}'): {type(exc).__name__}: {exc}")
-                log(f"    {backend.__name__}: {type(exc).__name__}: {str(exc)[:80]}", tag)
+                vlog(f"    {backend.__name__}: {type(exc).__name__}: {str(exc)[:80]}", tag)
                 found = []
             for hit in found:
                 key = hit["title"].lower()
@@ -834,6 +852,27 @@ class Forge:
         # never returns the provider's limit notice as a reply.
         return self.ai.generate_content(prompt, model_type=model_type, max_retries=2)
 
+    def ask_json(self, prompt: str, key: str, model_type: str = "writing") -> dict:
+        """`ask` + `_json_object`, re-asking up to MAX_JSON_RETRIES times when
+        the reply carries no JSON.
+
+        Live runs got replies like "Suspicious proof -- I'll brute-force the
+        counting formula" and nothing else: the model announced a tool call it
+        cannot make and ended its turn, which errored the whole conjecture.
+        """
+        reply = self.ask(prompt, model_type=model_type)
+        for attempt in range(MAX_JSON_RETRIES + 1):
+            try:
+                return _json_object(reply, key)
+            except ValueError:
+                if attempt == MAX_JSON_RETRIES:
+                    raise
+            reply = self.ask(
+                prompt + "\n\nYou have no tools and cannot run code. Do all checking in "
+                "your head, then reply with the JSON only.",
+                model_type=model_type,
+            )
+
     def write_and_run(
         self, brief: str, name: str, lang: str = "python", markers=(), model_type: str = "writing"
     ) -> dict:
@@ -854,12 +893,12 @@ class Forge:
         step = step or name
 
         started = time.time()
-        log(f"  {step}: writing {lang} ({model_type} model)", tag)
+        vlog(f"  {step}: writing {lang} ({model_type} model)", tag)
         code = _code_block(self.ask(brief, model_type=model_type))
-        log(f"  {step}: {len(code.splitlines())} lines written in {_dur(time.time() - started)}", tag)
+        vlog(f"  {step}: {len(code.splitlines())} lines written in {_dur(time.time() - started)}", tag)
         for attempt in range(MAX_CODE_REPAIRS + 1):
             label = f"  {step}: running" + (f" (repair {attempt})" if attempt else "")
-            log(f"{label}, up to {LEAN_TIMEOUT if lang == 'lean' else CODE_TIMEOUT}s", tag)
+            vlog(f"{label}, up to {LEAN_TIMEOUT if lang == 'lean' else CODE_TIMEOUT}s", tag)
             started = time.time()
             rc, out = runner(code)
             log(f"  {step}: exit {rc} in {_dur(time.time() - started)} — {_verdict_line(out)}", tag)
@@ -1069,10 +1108,9 @@ class Forge:
         cid = c["id"]
         queries = []
         if self.search:
-            log("  novelty: writing search queries", cid)
+            vlog("  novelty: writing search queries", cid)
             try:
-                queries = _json_object(
-                    self.ask(
+                queries = self.ask_json(
                         "Write literature search queries that would surface prior work on "
                         "this statement, if any exists.\n\n"
                         f"STATEMENT: {c['statement']}\nNOTATION: {c.get('notation', '')}\n\n"
@@ -1081,9 +1119,8 @@ class Forge:
                         "generality -- one query for the exact statement, one for the "
                         "general family it belongs to, one for the technique.\n\n"
                         'Return ONLY JSON: {"queries": ["...", "...", "..."]}',
-                        model_type="review",
-                    ),
                     "queries",
+                    model_type="review",
                 )["queries"]
                 queries = [str(q) for q in queries if str(q).strip()][:4] if isinstance(queries, list) else []
             except Exception as exc:
@@ -1097,8 +1134,7 @@ class Forge:
                 "\n\n".join(f"[{h['source']}] {h['title']}\n{h['url']}\n{h['abstract']}" for h in hits)
                 or "(nothing retrieved)"
             )
-            return _json_object(
-                self.ask(
+            return self.ask_json(
                     "You are a referee deciding whether a statement is already known. You "
                     "have your own knowledge AND the search results below.\n\n"
                     f"STATEMENT: {c['statement']}\nNOTATION: {c.get('notation', '')}\n\n"
@@ -1116,9 +1152,8 @@ class Forge:
                     'retrieved item that covers the statement"], "reasoning": "...", '
                     '"followup_queries": ["sharper queries to settle this, if unsure"], '
                     '"search_terms": ["terms a human should still check by hand"]}',
-                    model_type="review",
-                ),
                 "verdict",
+                model_type="review",
             )
 
         verdict = judge(found["hits"], queries)
@@ -1160,7 +1195,7 @@ class Forge:
         )
 
     def referee(self, c: dict, proof: str) -> dict:
-        reply = self.ask(
+        return self.ask_json(
             "You are a hostile referee. Find the error. Most submitted proofs contain one.\n\n"
             f"THEOREM: {c['statement']}\nNOTATION: {c.get('notation', '')}\n\n"
             f"PROOF:\n{proof}\n\n"
@@ -1171,9 +1206,9 @@ class Forge:
             'Return ONLY JSON: {"verdict": "VALID"|"GAPS"|"WRONG", "issues": [{"location": '
             '"lemma/step", "problem": "...", "severity": "fatal"|"major"|"minor"}], '
             '"summary": "..."}',
+            "verdict",
             model_type="review",
         )
-        return _json_object(reply, "verdict")
 
     def repair(self, c: dict, proof: str, report: dict) -> str:
         return self.ask(
@@ -1245,8 +1280,7 @@ class Forge:
         oracle for this, so it runs on the review model -- a different model from
         the one that wrote the Lean -- and is treated as a screen, not a proof.
         """
-        return _json_object(
-            self.ask(
+        return self.ask_json(
                 "Judge whether a Lean 4 formalization says the same thing as an informal "
                 "statement. Do not check the proof; only the statement.\n\n"
                 f"INFORMAL: {c['statement']}\nNOTATION: {c.get('notation', '')}\n\n"
@@ -1264,9 +1298,8 @@ class Forge:
                 'Return ONLY JSON: {"backtranslation": "the Lean statement in English", '
                 '"verdict": "FAITHFUL"|"NARROWER"|"DIVERGENT", "differences": ["..."], '
                 '"trivialized": true|false, "reasoning": "..."}',
-                model_type="review",
-            ),
             "verdict",
+            model_type="review",
         )
 
     def next_seed(self, history: list) -> str:
@@ -1279,7 +1312,7 @@ class Forge:
             if BOUNDED_SEED.match(str(h.get("seed") or "")) else h
             for h in history[-25:]
         ], indent=1, ensure_ascii=False) if history else "(none yet)"
-        reply = self.ask(
+        seed = str(self.ask_json(
             "Choose the next topic for an automated math research run. The pipeline can "
             "only keep results that are (a) checkable by brute force over explicit finite "
             "objects and (b) provable by elementary means, so pick an area rich in small "
@@ -1295,11 +1328,11 @@ class Forge:
             "written that way produced conjectures confined to the enumerated range, which "
             "the search settles outright and which are therefore not theorems.\n\n"
             'Return ONLY JSON: {"seed": "...", "why": "..."}',
+            "seed",
             model_type="review",
-        )
-        seed = str(_json_object(reply, "seed")["seed"]).strip()
+        )["seed"]).strip()
         if not seed:
-            raise ValueError(f"no seed in reply: {reply[:300]}")
+            raise ValueError("empty seed in reply")
         return seed
 
     def paper(self, seed: str, results: list) -> str:
@@ -1331,7 +1364,7 @@ def pipeline(forge: Forge, c: dict) -> dict:
     run = forge.run
     started = time.time()
     log(f"{c.get('title', '(untitled)')}", cid)
-    log(f"  claim: {str(c.get('statement', ''))[:150]}", cid)
+    vlog(f"  claim: {str(c.get('statement', ''))[:150]}", cid)
 
     falsification = run.stage(f"{cid}.falsify", lambda: forge.falsify(c))
     # every reader downstream looks for the canonical spelling
@@ -1796,15 +1829,25 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
     log(f"run directory: {run.path}")
     conjectures = run.stage("conjectures", lambda: forge.propose(seed, args.conjectures, args.workers))
     for c in conjectures:
-        log(f"proposed: {c.get('title', '(untitled)')}", c["id"])
+        vlog(f"proposed: {c.get('title', '(untitled)')}", c["id"])
     how = f"{args.workers} in parallel" if args.workers > 1 else "one at a time"
     rule(f"{len(conjectures)} conjectures, {how}")
 
+    finished = [0]
+
+    def one(c):
+        r = run_one(forge, c)
+        with _PRINT_LOCK:
+            finished[0] += 1
+            done = finished[0]
+        log(f"{progress_bar(done, len(conjectures))} {r['status']}", c["id"])
+        return r
+
     if args.workers > 1:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            results = list(pool.map(lambda c: run_one(forge, c), conjectures))
+            results = list(pool.map(one, conjectures))
     else:
-        results = [run_one(forge, c) for c in conjectures]
+        results = [one(c) for c in conjectures]
 
     run.data["results"] = results
     run.save()
@@ -1871,10 +1914,10 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=1, help="conjectures pursued in parallel")
     ap.add_argument(
         "--provider",
-        help="book writer provider (opencode-go, claude, hyper, ...). On a terminal the book "
+        help="ai-suite provider (opencode-go, claude, hyper, ...). On a terminal the "
              "writer's provider/model menu asks when this is omitted; otherwise the last pick is reused",
     )
-    ap.add_argument("--config", help="book writer AI config json; skips the provider menu")
+    ap.add_argument("--config", help="ai-suite AI config json; skips the provider menu")
     ap.add_argument("--model", help=f"model for proposing, proving, coding (menu default {DEFAULT_MODEL})")
     ap.add_argument("--review-model", help=f"model for referee stages (menu default {DEFAULT_REVIEW_MODEL})")
     ap.add_argument(
@@ -1909,6 +1952,8 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--runs", type=int, default=1, help="how many papers to attempt")
     ap.add_argument("--forever", action="store_true", help="keep researching until interrupted")
+    ap.add_argument("--verbose", action="store_true",
+                    help="log every search query, code attempt and stage start (compact by default)")
     ap.add_argument("--pause", type=int, default=0, help="seconds between runs in continuous mode")
     ap.add_argument("--lean-project", help="Lake project with Mathlib (else auto-detected)")
     ap.add_argument("--no-lean", action="store_true", help="run without Lean (required by default); nothing becomes machine-checked or publishable")
@@ -1924,6 +1969,8 @@ def main(argv=None) -> int:
         help=f"create a Mathlib Lake project at {DEFAULT_LEAN_PROJECT} and exit (multi-GB download)",
     )
     args = ap.parse_args(argv)
+    global VERBOSE
+    VERBOSE = VERBOSE or args.verbose
 
     # stages are minutes apart; keep progress visible when piped to a log
     sys.stdout.reconfigure(line_buffering=True)
@@ -1954,10 +2001,8 @@ def main(argv=None) -> int:
         args.model = args.model or DEFAULT_MODEL
         args.review_model = args.review_model or DEFAULT_REVIEW_MODEL
     else:
-        # The book writer's provider/model menu, so every AI script offers the
+        # The shared provider/model menu, so every AI script offers the
         # same, live-refreshed choices. Picks are remembered per script.
-        from ai_book_creator.cli import choose_ai
-
         interactive = sys.stdin.isatty() and not (args.model and args.review_model)
         _, args.config, picked = choose_ai(
             args.provider,
@@ -1969,7 +2014,7 @@ def main(argv=None) -> int:
         )
         args.model = args.model or picked[0]
         args.review_model = args.review_model or picked[-1]
-    # AIService reads these; setting them here keeps the shared book-writer
+    # AIService reads these; setting them here keeps the shared ai-suite
     # config file untouched.
     os.environ["AI_WRITING_MODEL"] = args.model
     os.environ["AI_REVIEW_MODEL"] = args.review_model
@@ -2187,6 +2232,21 @@ def _selftest() -> None:
     assert result["repairs"] == 1, result["repairs"]
     assert "COUNTEREXAMPLE: n=1" in result["output"], result["output"]
     assert "never printed a verdict" in stub.seen[1], "silent run was not reported back to the agent"
+
+    # a reply that only announces a tool call is asked again, once, not errored
+    stub = _StubAI(["Suspicious proof -- I'll brute-force it.", '{"verdict": "GAPS"}'])
+    assert Forge(stub, Run(tmp)).referee({"statement": "s"}, "p") == {"verdict": "GAPS"}
+    assert "no tools" in stub.seen[1], stub.seen[1]
+    # ... up to MAX_JSON_RETRIES times, then the conjecture errors
+    stub = _StubAI(["Checking..."] * MAX_JSON_RETRIES + ['{"verdict": "VALID"}'])
+    assert Forge(stub, Run(tmp)).referee({"statement": "s"}, "p") == {"verdict": "VALID"}
+    stub = _StubAI(["Checking..."] * (MAX_JSON_RETRIES + 1) + ['{"verdict": "VALID"}'])
+    try:
+        Forge(stub, Run(tmp)).referee({"statement": "s"}, "p")
+        raise AssertionError("more replies without JSON than MAX_JSON_RETRIES were accepted")
+    except ValueError:
+        pass
+    assert len(stub.seen) == MAX_JSON_RETRIES + 1, f"asked {len(stub.seen)} times"
 
     # the repair of a review-model script stays on the review model
     class _RoleAI(_StubAI):

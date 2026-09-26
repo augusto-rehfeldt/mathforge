@@ -123,8 +123,11 @@ cached and a resume does not ask the missing proposers again — the
 cached before that key existed is redone once), and
 `append_index` replaces a resumed run's entry instead of appending a duplicate.
 An unreadable `index.json` is renamed to `index.damaged-<time>.json`, never reset.
-Agents read JSON through `_json_object(reply, key)`, which picks the first object
-carrying the expected key out of whatever `_json_block` salvaged.
+Agents read JSON through `Forge.ask_json(prompt, key)`: `_json_object(reply, key)`
+picks the first object carrying the expected key out of whatever `_json_block`
+salvaged, and a reply with none is asked again (up to `MAX_JSON_RETRIES` = 3
+times), told it has no tools — live
+review models answered "I'll brute-force the formula" and stopped there.
 
 **Parallelism** is `ThreadPoolExecutor` at two levels — one call per proposer in
 `Forge.propose`, and one thread per conjecture in `research_run`. Proposals are
@@ -136,22 +139,23 @@ interleaved. Backend request spacing (arXiv's 3 seconds) is enforced globally
 across threads by `_RateLimiter`, not by a per-thread sleep.
 
 **Credentials and the AI client are not implemented here.** They are imported
-from the sibling `book writer` project (`ai_book_creator.services.ai_service.AIService`,
-`ai_book_creator.env.load_local_env`), located via `MATHFORGE_BOOK_WRITER`, which
+from the shared `ai_suite` package (`AIService`, `choose_ai`, `load_local_env`): the
+sibling `ai-suite` checkout (`AI_SUITE_DIR` overrides it), else the vendored `ai_suite/`
+copy in this repo, synced by ai-suite's `sync.py` -- never edit it here. AIService
 reads the opencode CLI's `auth.json`. Models and token budgets are passed by
 setting `AI_WRITING_MODEL` / `AI_REVIEW_MODEL` / `AI_*_COMPLETION_TOKENS` env
 vars before constructing `AIService`, so the shared config file stays untouched.
 `set_reasoning_effort` delegates to the public AIService method; SDK methods are never wrapped.
 
-Without `--config`, provider and models come from book writer's shared menu
-(`ai_book_creator.cli.choose_ai`, roles work + review, live model list). It asks
+Without `--config`, provider and models come from the shared menu
+(`ai_suite.choose_ai`, roles work + review, live model list). It asks
 on a terminal and reuses the last pick otherwise; picks are remembered in
 `math_output/provider_state.json`, first defaults opencode-go with
 deepseek-v4-pro / deepseek-v4-flash. `--provider` skips the provider question;
 `--model` / `--review-model` still win over the menu.
 
-Any book-writer provider config works, so OpenAI models are reachable two ways:
-`--config <book writer>/ai_book_creator/config/ai_config_openai.local.json` (API
+Any ai-suite provider config works, so OpenAI models are reachable two ways:
+`--config <ai-suite>/ai_suite/config/ai_config_openai.local.json` (API
 key) or `ai_config_openai_oauth.json` (ChatGPT sign-in — `AIService.__init__`
 starts `npx openai-oauth` on `127.0.0.1:10531` and opens a browser the first
 time). `--model` / `--review-model` override whatever model ids the config

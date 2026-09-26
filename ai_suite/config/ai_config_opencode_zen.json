@@ -1,0 +1,49 @@
+{
+  "provider": "opencode",
+  "writing_model": "deepseek-v4-flash-free",
+  "review_model": "deepseek-v4-flash-free",
+  "base_url": "https://opencode.ai/zen/v1",
+  "api_key_env": "OPENCODE_ZEN_API_KEY",
+  "usage_state_path": "book_output/ai_usage_state.json",
+  "timeout": 900,
+  "min_book_pages": 250,
+  "min_chapter_words": 1200,
+  "writing_completion_tokens": 131072,
+  "review_completion_tokens": 131072,
+  "planning_completion_tokens": 131072,
+  "default_completion_tokens": 131072,
+  "models": {
+    "deepseek-v4-flash-free": {
+      "name": "DeepSeek V4 Flash Free",
+      "max_output": 128000
+    },
+    "nemotron-3-ultra-free": {
+      "name": "Nemotron 3 Ultra Free",
+      "max_output": 128000
+    },
+    "nemotron-3.5-lightning-free": {
+      "name": "Nemotron 3.5 Lightning Free",
+      "max_output": 262144
+    },
+    "space-bunny-free": {
+      "name": "Space Bunny Free",
+      "max_output": 524288
+    },
+    "mimo-v2.6-flash-free": {
+      "name": "MiMo V2.6 Flash Free",
+      "max_output": 32000
+    },
+    "mimo-v2.5-free": {
+      "name": "MiMo V2.5 Free",
+      "max_output": 32000
+    },
+    "big-pickle": {
+      "name": "Big Pickle",
+      "max_output": 32000
+    },
+    "ling-3.0-flash-fin-free": {
+      "name": "Ling 3.0 Flash Fin Free",
+      "max_output": 32768
+    }
+  }
+}

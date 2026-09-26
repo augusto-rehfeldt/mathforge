@@ -1,0 +1,21 @@
+{
+  "provider": "groq",
+  "use_openai_client": true,
+  "writing_model": "groq/compound",
+  "review_model": "groq/compound",
+  "base_url": "https://api.groq.com/openai/v1",
+  "api_key_env": "GROQ_API_KEY",
+  "usage_state_path": "book_output/ai_usage_state.json",
+  "groq_rate_state_path": "book_output/groq_usage_state.json",
+  "groq_rate_limits": {
+    "tpm": 70000,
+    "rpm": 30,
+    "rpd": 250
+  },
+  "groq_daily_token_limit": 500000,
+  "groq_safety_margin": 0.1,
+  "timeout": 900,
+  "min_book_pages": 300,
+  "min_chapter_words": 1000,
+  "max_chapter_expansion_attempts": 4
+}

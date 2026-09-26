@@ -1,0 +1,11 @@
+{
+  "provider": "openai-oauth",
+  "use_openai_client": true,
+  "writing_model": "gpt-5.6-terra",
+  "review_model": "gpt-5.6-terra",
+  "base_url": "http://127.0.0.1:10531/v1",
+  "timeout": 900,
+  "min_book_pages": 300,
+  "min_chapter_words": 1000,
+  "max_chapter_expansion_attempts": 4
+}

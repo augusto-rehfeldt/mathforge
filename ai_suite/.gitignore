@@ -1,0 +1,4 @@
+# Local keys/overrides and runtime state stay out of every repository that carries this package.
+config/*.local.json
+config/*state*.json
+__pycache__/

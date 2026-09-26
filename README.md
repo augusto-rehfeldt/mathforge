@@ -98,7 +98,8 @@ Or point `--lean-project` / `MATHFORGE_LEAN_PROJECT` at an existing Lake project
 ### Models and credentials
 
 The AI client, opencode credential loading and usage accounting come from the
-sibling `book writer` project; set `MATHFORGE_BOOK_WRITER` if it lives elsewhere.
+shared `ai_suite` package: the sibling `ai-suite` checkout (`AI_SUITE_DIR` if it lives
+elsewhere), else the copy vendored into this repository.
 Credentials are read from the opencode CLI's own `auth.json`, so
 `opencode auth login` is the only setup.
 

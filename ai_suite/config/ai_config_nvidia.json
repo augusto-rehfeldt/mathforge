@@ -1,0 +1,20 @@
+{
+  "provider": "openrouter",
+  "use_openai_client": true,
+  "writing_model": "deepseek-ai/deepseek-v4-pro",
+  "review_model": "deepseek-ai/deepseek-v4-pro",
+  "base_url": "https://integrate.api.nvidia.com/v1",
+  "api_key_env": "NVIDIA_API_KEY",
+  "usage_state_path": "book_output/ai_usage_state.json",
+  "timeout": 900,
+  "writing_completion_tokens": 16384,
+  "review_completion_tokens": 16384,
+  "planning_completion_tokens": 8192,
+  "default_completion_tokens": 16384,
+  "models": {
+    "deepseek-ai/deepseek-v4-pro": {
+      "name": "DeepSeek V4 Pro (NVIDIA NIM)",
+      "max_output": 16384
+    }
+  }
+}
