@@ -429,6 +429,13 @@ LIMIT_ERROR_RE = re.compile(
 # limit ("Rate limit exceeded. Please retry after a brief wait", HTTP 429) clears in
 # minutes, so only a window earns the long pause.
 LIMIT_WINDOW_RE = re.compile(r"hit your \w+ limit|usage limit|(?<!rate )limit reached", re.I)
+# Errors no retry can fix: the model id is wrong for this provider, or the account
+# has no funds/credits/subscription for it. Also Claude Code's reply to a bad
+# --model ("There's an issue with the selected model"), which arrives as text.
+REFUSAL_RE = re.compile(
+    r"model not found|issue with the selected model|insufficient (account )?(funds|balance|credits?)|"
+    r"doesn'?t have any credits|subscription is required", re.I
+)
 LIMIT_RETRY = 60  # seconds between retries of a limited call
 LIMIT_TRIES = 5  # limited calls in a row before the long pause
 LIMIT_PAUSE = 5 * 3600  # window with no reset time given: assume one whole 5-hour window
@@ -1645,6 +1652,8 @@ class AIService:
             try:
                 text = self._generate_content_once(prompt, model_type, max_retries, max_completion_tokens, model,
                                                    system, temperature)
+                if len(text) < 500 and REFUSAL_RE.search(text):
+                    raise RuntimeError(f"[{self.provider_label}] {' '.join(text.split())[:300]}")
                 if len(text) >= 500 or not LIMIT_NOTICE_RE.search(text):
                     self._note_model_used(model, model_type)
                     return text
@@ -2060,11 +2069,13 @@ class AIService:
                             time.sleep(int(retry_after))
                             attempt += 1
                             continue
-                if getattr(e, "status_code", None) == 403:
+                status = getattr(e, "status_code", None)
+                if status in (401, 402, 403, 404) or REFUSAL_RE.search(str(e)):
                     # A refusal, not an outage (opencode-zen's free models now only
-                    # answer OpenCode's own client): retrying cannot change the answer.
-                    print(f"[{self.provider_label}] {model_to_use} refused the request (HTTP 403); "
-                          "choose another provider or model")
+                    # answer OpenCode's own client; an unknown model id; no funds):
+                    # retrying cannot change the answer.
+                    print(f"[{self.provider_label}] {model_to_use} refused the request "
+                          f"({f'HTTP {status}' if status else e}); choose another provider or model")
                     raise
                 last_error = e
                 print(f"[{self.provider_label}] Error on attempt {attempt + 1}: {e}")
