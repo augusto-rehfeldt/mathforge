@@ -523,17 +523,52 @@ def _prompt_openai_model(
 MENU_ROWS = 20  # rows on screen at once; the rest scroll
 
 
+class _BelowLabel:
+    """sys.stdout while a loading label shows: anything printed meanwhile (a CLI
+    notice, a retry warning) wipes the label first and redraws it after a finished
+    line, so the label always sits on the last row and never gets stranded."""
+
+    def __init__(self, inner, text: str):
+        self.inner, self.text, self.shown = inner, text, False
+
+    def show(self) -> None:
+        self.inner.write(self.text)
+        self.inner.flush()
+        self.shown = True
+
+    def hide(self) -> None:
+        if self.shown:
+            self.inner.write("\r\033[K")
+            self.inner.flush()
+            self.shown = False
+
+    def write(self, data: str) -> int:
+        self.hide()
+        n = self.inner.write(data)
+        if data.endswith("\n"):
+            self.show()
+        return n
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
 @contextlib.contextmanager
 def _loading(what: str):
-    """"Loading <what>..." on a terminal while the block runs, erased when it ends."""
-    tty = sys.stdout.isatty()
-    if tty:
-        print(_color(f"Loading {what}...", "2"), end="", flush=True)
+    """"Loading <what>..." on a terminal while the block runs, in place on the last
+    row, erased when it ends. Plain passthrough when piped."""
+    if not sys.stdout.isatty():
+        yield
+        return
+    os.system("")  # ANSI erase codes on the Windows console, even under NO_COLOR
+    label = _BelowLabel(sys.stdout, _color(f"Loading {what}...", "2"))
+    label.show()
+    sys.stdout = label
     try:
         yield
     finally:
-        if tty:
-            print("\r\033[K", end="", flush=True)
+        sys.stdout = label.inner
+        label.hide()
 
 
 def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: str = "",
