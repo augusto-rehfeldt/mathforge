@@ -1,8 +1,8 @@
 {
   "provider": "openai-oauth",
   "use_openai_client": true,
-  "writing_model": "gpt-5.6-terra",
-  "review_model": "gpt-5.6-terra",
+  "writing_model": "gpt-6-sol",
+  "review_model": "gpt-6-sol",
   "base_url": "http://127.0.0.1:10531/v1",
   "timeout": 900,
   "min_book_pages": 300,

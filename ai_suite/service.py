@@ -1780,6 +1780,11 @@ class AIService:
         attempt = 0
         last_error = None
         self.last_usage = None
+        if self.provider == "openai-oauth":
+            # ChatGPT's backend refuses `temperature` on every gpt-6 model; the proxy
+            # answers 400 unstreamed and drops a streamed reply mid-body, which
+            # looked like a flaky connection and burned every retry.
+            temperature = None
         # Chat endpoints take the system prompt as its own message and the CLIs as
         # their own flag; every other route (Gemini, the responses API) gets it
         # ahead of the prompt.
