@@ -189,32 +189,72 @@ def _cli_system(system: Optional[str]) -> str:
     return f"{CLI_NEUTRAL_SYSTEM}\n\n{system}" if system else CLI_NEUTRAL_SYSTEM
 
 
-def _run_cli(args: List[str], prompt: str, timeout: int,
-             env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+def _run_cli(args: List[str], prompt: str, timeout: int, env: Optional[Dict[str, str]] = None,
+             abort: Optional["re.Pattern[str]"] = None) -> subprocess.CompletedProcess:
     """The prompt goes in on stdin, never as an argument: Windows caps a command
     line at 32k characters and a chapter-sized prompt blows straight past it.
 
     A timeout kills the whole process tree. On Windows the CLI is a .cmd shim, and
     subprocess.run killed only cmd.exe: node kept the output pipes open, so the
-    post-kill read waited forever and the caller hung instead of retrying."""
+    post-kill read waited forever and the caller hung instead of retrying.
+
+    `abort` is watched on stderr as it arrives: a matching line kills the tree and
+    raises RuntimeError with the line's first group, for a CLI that logs an error
+    and then retries it silently instead of exiting."""
     flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
     extra = dict(flags, env={**os.environ, **env}) if env else flags
     # No `with`: its exit waits for the pipes, which a surviving grandchild keeps open.
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", cwd=tempfile.gettempdir(),
                             **extra)
-    try:
-        out, err = proc.communicate(prompt, timeout=timeout)
-    except subprocess.TimeoutExpired:
+
+    def kill() -> None:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, **flags)
         proc.kill()
+
+    if abort is None:
         try:
-            proc.communicate(timeout=10)
+            out, err = proc.communicate(prompt, timeout=timeout)
         except subprocess.TimeoutExpired:
-            pass  # a survivor still holds the pipes; give up on its output, not the caller
+            kill()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass  # a survivor still holds the pipes; give up on its output, not the caller
+            raise
+        return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+    lines: Dict[str, List[str]] = {"out": [], "err": []}
+    failure: List[str] = []
+
+    def pump(stream, key: str) -> None:
+        for line in stream:
+            lines[key].append(line)
+            match = key == "err" and not failure and abort.search(line)
+            if match:
+                failure.append(match.group(1) if match.groups() else line.strip())
+                kill()
+
+    readers = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
+    for reader in readers:
+        reader.start()
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except OSError:
+        pass  # the child died early (or was aborted); its stderr says why
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill()
         raise
-    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+    for reader in readers:
+        reader.join(10)  # a survivor holding the pipes must not hang the caller
+    if failure:
+        raise RuntimeError(failure[0])
+    return subprocess.CompletedProcess(args, proc.returncode, "".join(lines["out"]), "".join(lines["err"]))
 
 
 def claude_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: Optional[str] = None) -> str:
@@ -284,6 +324,9 @@ def opencode_executable() -> str:
 
 
 OPENCODE_BARE_CONFIG = os.path.join(tempfile.gettempdir(), "ai-suite-opencode-config")
+# The answering model's stream error. `small=true` is OpenCode's side call that titles
+# the session; its failure (e.g. "Insufficient account funds") is harmless.
+OPENCODE_STREAM_ERROR_RE = re.compile(r'message="stream error".*\bsmall=false\b.*\berror\.error="([^"]*)"')
 
 
 def opencode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: Optional[str] = None,
@@ -315,7 +358,14 @@ def opencode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: O
     env = {"XDG_CONFIG_HOME": OPENCODE_BARE_CONFIG, "OPENCODE_DISABLE_CLAUDE_CODE": "1"}
     if max_output:
         env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = str(max_output)
-    proc = _run_cli(args, f"{_cli_system(system)}\n\n{prompt}", timeout, env=env)
+    # On a gateway error (free-tier "Rate limit exceeded") OpenCode logs it and
+    # retries forever without printing an event, so the run hung until the timeout.
+    # Its error log ends the run now and generate_content's limit wait takes over.
+    try:
+        proc = _run_cli(args + ["--print-logs", "--log-level", "ERROR"],
+                        f"{_cli_system(system)}\n\n{prompt}", timeout, env=env, abort=OPENCODE_STREAM_ERROR_RE)
+    except RuntimeError as exc:
+        raise RuntimeError(f"opencode {model}: {exc}") from None
     texts: List[str] = []
     kinds: List[str] = []
     finish: Dict[str, Any] = {}
