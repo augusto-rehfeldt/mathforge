@@ -198,17 +198,40 @@ to `Forge.next_seed` in continuous mode so it avoids repeating topics.
 
 ### Publishing
 
-`--publish` posts a **public** gist through the `gh` CLI for each result whose
-status rests on Lean — `machine-verified` and `machine-refuted` only
-(`PUBLISH_STATUSES`). Gist URLs are cached in `state.json` so a resumed run
-reuses rather than reposts, and a failed post retries on the next resume. A
-cached gist whose result no longer qualifies is logged loudly, never deleted
-automatically. The gist ends with a `## Models` section (`_model_lines`): code
-artifacts record their own `model` in `write_and_run`, and the rest fall back to
-the run's `models` pair that `Forge.__init__` stores in `state.json`; runs from
-before that record say `not recorded`. The body goes up as `<cN>_gist/README.md` because a gist lists
-files alphabetically; the title is `headline(r)`. A gist is public the instant
-it is created.
+`--publish` publishes each result whose status rests on Lean -- `machine-verified`
+and `machine-refuted` only (`PUBLISH_STATUSES`) -- as a folder of one public GitHub
+repository (`RESULTS_REPO`, default `<gh user>/mathforge-results`, checkout
+`RESULTS_CHECKOUT`; `_results_checkout` creates and clones it on first use).
+`publish_result` writes the folder (`<run dir>-<cN>`: README from `_publication`,
+the generated scripts, `result.json`), regenerates the root README from every
+`result.json` (`results_index`), commits and pushes, under `_REPO_LOCK`. URLs are
+cached in `state.json` under `cN.published`, so a resumed run reuses rather than
+republishes, and a failed publish retries on the next resume. A cached URL
+(`cN.published`, or an old `cN.gist`) whose result no longer qualifies is logged
+loudly, never deleted automatically. `--publish-existing` runs `publish` over every
+run under `math_output` and exits.
+
+Credit: `_publication` puts a `**Models:**` line (`models_used`) under the verdict
+and ends with a `## Models` section (`_model_rows`); `paper.md` gets the same
+section (`paper_models`), appended at write time rather than cached, and each
+refutation in `negative_results.md` gets a `**Models.**` line. Code artifacts
+record their own `model` in `write_and_run`; the rest fall back to the run's
+`models` pair that `Forge.__init__` stores in `state.json`; runs from before that
+record say `not recorded`.
+
+Palomar (palomar-registry.org, a registry of Lean-verified mathematics) is prepared
+for, never submitted to: it asks for human review and a research-interest floor.
+`palomar_bundle` writes a Lake project into the folder: `palomar_split` cuts the
+checked Lean file into top-level chunks (`_lean_chunks`) and wraps both halves in
+`namespace Mathforge.<Folder>`; Challenge keeps every definition and states only the
+main theorem (`refutation`, or `main_theorem`, which the Lean prompt now asks for,
+else the last theorem) with `sorry`; Solution is the whole file minus `#` commands.
+`private` is stripped from both, because a private name is mangled with its module
+and Comparator would see two different definitions. Both halves are elaborated
+first; a failure means no bundle, and the README says why. `formalization.yaml`
+(v0.4, `formalization_yaml`) is written with JSON-quoted scalars; `Forge.classify`
+(review model, cached as `cN.classify`) supplies the arXiv/MSC codes, falling back
+to math.CO / 05A99. `lake comparator` itself has not been run locally.
 
 ## Security
 

@@ -23,7 +23,8 @@ Usage:
     python mathforge.py --forever --resume         # finish the newest run, then carry on
     python mathforge.py --forever --workers 4        # picks its own topics, paper after paper
     python mathforge.py --runs 10 --pause 300        # ten papers, five minutes apart
-    python mathforge.py --forever --publish          # public gist per machine-checked result
+    python mathforge.py --forever --publish          # public results-repo folder per machine-checked result
+    python mathforge.py --publish-existing           # publish results already on disk, then exit
     python mathforge.py --setup-lean     # one-off: Mathlib project for Lean checking
 
 Every run lands in math_output/<slug>/ (state.json, generated scripts, paper.md)
@@ -43,8 +44,9 @@ Statuses a conjecture can end in:
                      failure); nothing is cached, so --resume retries it
 
 With --publish, the two statuses that rest on a machine verdict rather than on a
-model's opinion -- `machine-verified` and `machine-refuted` -- are posted as public
-GitHub gists through the `gh` CLI. Nothing is published without that flag.
+model's opinion -- `machine-verified` and `machine-refuted` -- are published as
+folders of a public GitHub repository (with a Palomar-ready Lake project where the
+Lean file splits cleanly) through the `gh` CLI. Nothing is published without that flag.
 """
 
 from __future__ import annotations
@@ -938,7 +940,7 @@ class Forge:
         self.run = run
         self.lean_project = lean_project
         self.search = search
-        # set by the CLI before AIService is built; recorded so a gist can say
+        # set by the CLI before AIService is built; recorded so a publication can say
         # which model did what. A resume keeps the first pair for the run-level
         # record; code artifacts carry their own `model`, so they stay exact.
         self.models = {"writing": os.getenv("AI_WRITING_MODEL", ""), "review": os.getenv("AI_REVIEW_MODEL", "")}
@@ -1361,7 +1363,7 @@ class Forge:
             f"INFORMAL PROOF:\n{proof}\n\n"
             "Write ONE self-contained Lean 4 file that:\n"
             "- opens with `import Mathlib` and any `open` clauses you need;\n"
-            "- states the theorem formally, as faithfully as possible. The statement is "
+            "- states the theorem formally as `theorem main_theorem`, as faithfully as possible. The statement is "
             "the part that matters most: a formalization that is easier than the informal "
             "claim is worthless, so do not weaken hypotheses, do not add extra ones, and "
             "do not special-case the conclusion.\n"
@@ -1441,6 +1443,24 @@ class Forge:
         if not seed:
             raise ValueError("empty seed in reply")
         return seed
+
+    def classify(self, r: dict) -> dict:
+        """arXiv and MSC 2020 codes for a published result's formalization.yaml.
+        Metadata, not a verdict; a reply that fails the format falls back to
+        combinatorics, where nearly every mathforge seed lives."""
+        fallback = {"arxiv": ["math.CO"], "msc2020": ["05A99"]}
+        try:
+            got = self.ask_json(
+                "Classify this result. Reply with JSON only: {\"arxiv\": [1-2 official arXiv math "
+                "categories such as \"math.CO\"], \"msc2020\": [1-3 five-character MSC 2020 codes such "
+                "as \"05A15\"]}.\n\n"
+                f"STATEMENT: {r.get('statement', '')}\nNOTATION: {r.get('notation', '')}",
+                "arxiv", model_type="review")
+        except (ValueError, RuntimeError):
+            return fallback
+        arxiv = [c for c in got.get("arxiv") or [] if isinstance(c, str) and re.fullmatch(r"math\.[A-Z]{2}", c)][:2]
+        msc = [c for c in got.get("msc2020") or [] if isinstance(c, str) and re.fullmatch(r"\d\d[A-Z-]\d\d", c)][:8]
+        return {"arxiv": arxiv or fallback["arxiv"], "msc2020": msc or fallback["msc2020"]}
 
     def paper(self, seed: str, results: list) -> str:
         return self.ask(
@@ -1606,7 +1626,15 @@ def _for_paper(r: dict) -> dict:
     return slim
 
 
-def negative_results(seed: str, results: list) -> str:
+def paper_models(results: list, models: dict | None) -> str:
+    """The paper's closing `## Models` section: who proposed, proved and checked each result."""
+    lines = ["## Models", ""]
+    for r in results:
+        lines += [f"**{r.get('title', r['id'])}** (`{r['status']}`)", "", *_model_lines(r, models), ""]
+    return "\n".join(lines)
+
+
+def negative_results(seed: str, results: list, models: dict | None = None) -> str:
     """Record what died and why.
 
     A failed counterexample search is the evidence that supports a conjecture and
@@ -1622,7 +1650,7 @@ def negative_results(seed: str, results: list) -> str:
             lines += [f"**Notation.** {r['notation']}", ""]
         output = (r.get("falsification") or {}).get("output", "")
         if r["status"] in REFUTED:
-            lines += [f"**Counterexample.** `{_witness(r)}`", ""]
+            lines += [f"**Counterexample.** `{_witness(r)}`", "", f"**Models.** {models_used(r, models)}", ""]
         elif r["status"] == "known":
             novelty = r.get("novelty") or {}
             lines += [
@@ -1657,12 +1685,12 @@ Read it as a machine-checked artifact, not as a reviewed paper.
 Only two outcomes are published, both resting on Lean 4 + Mathlib rather than on
 a model's opinion of its own work:
 
-- **machine-refuted** — an adversarial script found a witness, a second model's
-  script re-checked it against the statement from scratch, and Lean elaborated a
+- **machine-refuted** — an adversarial script found a witness, a separate
+  model call's script re-checked it against the statement from scratch, and Lean elaborated a
   sorry-free proof of the negation of the claim.
 - **machine-verified** — Lean elaborated the proof with no `sorry`.
 
-In both cases a second model back-translated the Lean statement and judged it
+In both cases a separate model call back-translated the Lean statement and judged it
 faithful to the informal one. Lean certifies the Lean statement; the
 back-translation is a screening filter, not an oracle, so read the attached
 `.lean` file against the statement above.
@@ -1670,7 +1698,7 @@ back-translation is a screening filter, not an oracle, so read the attached
 Novelty screening is a bounded automated search over arXiv, Crossref and
 OpenAlex with model-written queries. It is blind to books, to journals outside
 those indexes, and to anything phrased differently: a result here may well be a
-rediscovery. Corrections welcome in the comments.
+rediscovery. Corrections welcome as GitHub issues.
 """
 
 
@@ -1696,7 +1724,7 @@ def _witness(r: dict) -> str:
 
 
 def headline(r: dict) -> str:
-    """What the gist title leads with: `Refuted: <claim>` / `Proved: <claim>`."""
+    """What a publication's title leads with: `Refuted: <claim>` / `Proved: <claim>`."""
     claim = str(r.get("headline") or r.get("title") or r["id"]).strip().rstrip(".")
     return f"{'Refuted' if r.get('status') in REFUTED else 'Proved'}: {claim}"
 
@@ -1714,8 +1742,8 @@ def _lean_lines(lean: dict) -> list:
     return lines
 
 
-def _model_lines(r: dict, models: dict | None) -> list:
-    """Who did what. A code artifact names its own model; the rest falls back to
+def _model_rows(r: dict, models: dict | None) -> list:
+    """Who did what, as (role, model) pairs. A code artifact names its own model; the rest falls back to
     the run's work/review pair, and anything unrecorded says so."""
     models = models or {}
 
@@ -1732,18 +1760,27 @@ def _model_lines(r: dict, models: dict | None) -> list:
                 ("Independent check script", "independent_check", "review")]
     if r.get("lean"):
         rows += [("Lean formalization", "lean", "work"), ("Faithfulness judge", None, "review")]
-    return [f"- {label}: {who(key, role)}" for label, key, role in rows]
+    return [(label, who(key, role)) for label, key, role in rows]
+
+
+def _model_lines(r: dict, models: dict | None) -> list:
+    return [f"- {label}: {model}" for label, model in _model_rows(r, models)]
+
+
+def models_used(r: dict, models: dict | None) -> str:
+    """The distinct models behind a result, in pipeline order, for a one-line credit."""
+    return ", ".join(dict.fromkeys(m for _label, m in _model_rows(r, models) if m != "not recorded")) or "not recorded"
 
 
 def _publication(seed: str, r: dict, models: dict | None = None) -> str:
-    """The gist body: verdict first, then the claim, the evidence, the caveats."""
+    """The publication's README: verdict first, then the claim, the evidence, the caveats."""
     cid = r["id"]
     refuted = r["status"] in REFUTED
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     witness = _witness(r) if refuted else ""
     verdict = (f"**Verdict: FALSE.** Counterexample: `{witness}`" if refuted
                else "**Verdict: TRUE.** Lean 4 + Mathlib accepted a sorry-free proof.")
-    lines = [f"# {headline(r)}", "", verdict, ""]
+    lines = [f"# {headline(r)}", "", verdict, "", f"**Models:** {models_used(r, models)} (roles under *Models* below)", ""]
     if r.get("title") and r.get("headline"):
         lines += [f"*{r['title']}*", ""]
     lines += [
@@ -1767,7 +1804,7 @@ def _publication(seed: str, r: dict, models: dict | None = None) -> str:
             "## Machine verification",
             "",
             "- Adversarial search (`*_falsify.py`) reported the witness.",
-            "- Independent re-check (`*_confirm.py`, a different model, definitions "
+            "- Independent re-check (`*_confirm.py`, a separate model call, definitions "
             "re-implemented from the statement): confirmed.",
             *(_lean_lines(lean) if lean else ["- Lean: not run."]),
             "",
@@ -1803,59 +1840,339 @@ def _publication(seed: str, r: dict, models: dict | None = None) -> str:
     return "\n".join(lines + [DISCLAIMER])
 
 
-def _gist_url(stdout: str) -> str:
-    """`gh gist create` prints progress on stderr and the URL last on stdout."""
-    return next((ln.strip() for ln in reversed(stdout.splitlines()) if ln.strip().startswith("https://")), "")
+RESULTS_REPO = os.getenv("MATHFORGE_RESULTS_REPO", "mathforge-results")  # `name` or `owner/name`
+RESULTS_CHECKOUT = Path(os.getenv("MATHFORGE_RESULTS_DIR") or Path.home() / "mathforge-results")
+PALOMAR_FORM = "https://submit.palomar-registry.org/"
+_REPO_LOCK = threading.Lock()
+# top-level Lean commands and the declaration keywords a chunk is classified by
+_TOP = re.compile(r"^(?:@\[|/-|--|set_option\b|private\b|protected\b|noncomputable\b|nonrec\b|theorem\b|lemma\b|"
+                  r"example\b|def\b|abbrev\b|instance\b|structure\b|inductive\b|class\b|namespace\b|section\b|"
+                  r"end\b|open\b|variable\b|universe\b|attribute\b|notation\b|macro\b|import\b|#)")
+_KIND = re.compile(r"(?<![\w.])(import|theorem|lemma|example|def|abbrev|instance|structure|inductive|class|"
+                   r"namespace|section|end|open|variable|universe|attribute|notation|macro|#\w+)\b")
 
 
-def publish_gist(run: Run, seed: str, r: dict) -> dict:
-    """Post one result as a public gist via `gh`. Never raises: publishing is a
-    side effect of research, and a failed post must not lose the result."""
-    if not shutil.which("gh"):
-        return {"error": "gh not on PATH; install the GitHub CLI to publish"}
-    cid = r["id"]
-    # a gist lists its files alphabetically: README.md sorts above c1_*.py, so
-    # the write-up is what a reader sees first
-    body = run.path / f"{cid}_gist" / "README.md"
-    body.parent.mkdir(exist_ok=True)
-    body.write_text(_publication(seed, r, run.data.get("models")), encoding="utf-8")
-    # the generated artifacts are the point: a reader can re-run them
-    extras = ([f"{cid}_refute.lean", f"{cid}_falsify.py", f"{cid}_confirm.py"] if r["status"] in REFUTED
-              else [f"{cid}_lean.lean", f"{cid}_falsify.py", f"{cid}_check.py"])
-    files = [body] + [run.path / name for name in extras if (run.path / name).exists()]
-    desc = f"{headline(r)} (mathforge, {r['status']})"
+def _gh(*args: str, cwd: Path | None = None, timeout: int = 180) -> subprocess.CompletedProcess:
+    return subprocess.run(list(args), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=timeout, cwd=str(cwd) if cwd else None)
+
+
+def _lean_chunks(code: str) -> list:
+    """Top-level commands, each with the comments, attributes and `set_option … in`
+    that lead into it."""
+    chunks: list = []
+    for line in code.splitlines():
+        if chunks and (not _TOP.match(line) or _chunk_kind(chunks[-1]) is None):
+            chunks[-1] += "\n" + line
+        else:
+            chunks.append(line)
+    return chunks
+
+
+def _chunk_kind(chunk: str) -> str | None:
+    text = re.sub(r"(?:set_option\s+\S+\s+\S+|open\b[^\n]*?)\s+in\b", " ", _uncommented(chunk))
+    m = _KIND.search(text)
+    return m.group(1) if m else None
+
+
+def palomar_split(code: str, main: str, namespace: str) -> tuple[str, str, str]:
+    """(Challenge.lean, Solution.lean, qualified main theorem) from one checked file.
+
+    Solution is the file as Lean checked it, wrapped in `namespace`. Challenge
+    keeps the definitions (made public) and states only `main` with `sorry`: the surface
+    a Palomar reader audits, which Comparator matches against Solution.
+    """
+    header, challenge, solution = [], [], []
+    for chunk in _lean_chunks(code.rstrip()):
+        kind = _chunk_kind(chunk)
+        # a private name is mangled with its module, so Challenge's and Solution's
+        # copies of one definition would differ and Comparator would reject the pair
+        chunk = re.sub(r"(?m)^((?:@\[[^\]]*\]\s*)*)private\s+", r"\1", chunk).rstrip()
+        if kind is None or kind.startswith("#"):
+            continue  # the axiom probe and stray #eval/#check are for the pipeline, not the reader
+        if kind == "import":
+            header.append(chunk)
+            continue
+        solution.append(chunk)
+        if kind in ("theorem", "lemma", "example"):
+            m = _DECL.match(next((ln for ln in _uncommented(chunk).splitlines() if _DECL.match(ln)), ""))
+            if m and m.group(1).split(".")[-1] == main:
+                decl = re.search(r"(?<![\w.])(?:theorem|lemma)\s+" + re.escape(m.group(1)), chunk).end()
+                challenge.append(chunk[:chunk.index(":=", decl)].rstrip() + " := by\n  sorry")
+        else:
+            challenge.append(chunk)
+
+    def wrap(body: list) -> str:
+        return "\n".join(header) + f"\n\nnamespace {namespace}\n\n" + "\n\n".join(body) + f"\n\nend {namespace}\n"
+
+    names = [n for n in _theorems(wrap(solution))[0] if n.split(".")[-1] == main]
+    if len(names) != 1 or sum(bool(re.search(r"\bsorry\b", c)) for c in challenge) != 1:
+        raise ValueError(f"could not isolate the main theorem `{main}` in the Lean file")
+    return wrap(challenge), wrap(solution), names[0]
+
+
+def _main_theorem(r: dict) -> str:
+    if r["status"] in REFUTED:
+        return "refutation"
+    names = [n.split(".")[-1] for n in _theorems((r.get("lean") or {}).get("code", ""))[0]]
+    return "main_theorem" if "main_theorem" in names else (names[-1] if names else "")
+
+
+def _yaml(value, indent: int = 0) -> str:
+    """Block YAML with JSON-quoted scalars: always valid, no dependency."""
+    pad = "  " * indent
+    if isinstance(value, dict):
+        return "".join(f"{pad}{k}:" + (f"\n{_yaml(v, indent + 1)}" if isinstance(v, (dict, list)) and v
+                                        else f" {_yaml(v)}\n") for k, v in value.items())
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        return "".join(f"{pad}-" + (f"\n{_yaml(v, indent + 1)}" if isinstance(v, (dict, list)) and v
+                                     else f" {_yaml(v)}\n") for v in value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def formalization_yaml(r: dict, models: dict | None, maintainer: str, namespace: str, main: str,
+                       classification: dict) -> str:
+    refuted = r["status"] in REFUTED
+    faith = (r.get("lean") or {}).get("faithfulness") or {}
+    used = [m for m in models_used(r, models).split(", ") if m != "not recorded"]
+    claim = " ".join(str(r.get("statement", "")).split())
+    return ("# yaml-language-server: $schema=https://raw.githubusercontent.com/mathlib-initiative/"
+            "formalization.yaml/main/schema/formalization.schema.json\n") + _yaml({
+        "version": "v0.4",
+        "project": {
+            "name": headline(r),
+            "description": (f"A counterexample to the claim: {claim}" if refuted else claim),
+            "authors": [f"{maintainer} (operator of the mathforge pipeline)"],
+            "license": "Apache-2.0",
+            "responsible_maintainers": [maintainer],
+        },
+        "classification": classification,
+        "sources": [{
+            "title": ("Refutation of a conjecture proposed by a language model in an automated mathforge run"
+                      if refuted else "Theorem conjectured and proved in an automated mathforge run"),
+            "type": "original-proof",
+            "relationship": "other",
+            "note": "Novelty was screened only by an automated search of arXiv, Crossref and OpenAlex; "
+                    "the result may be a rediscovery.",
+        }],
+        "related_formalizations": [],
+        "status": {
+            "scope": (f"Formalizes the negation of the claim above as `{main}`." if refuted
+                      else f"Formalizes the statement above as `{main}`.")
+                     + " The Lean statement was back-translated by a model and judged "
+                     + f"{faith.get('verdict', 'n/a')}; it was not audited by a person.",
+            "sorry_count": 0,
+            "sorry_in_definitions": 0,
+            "axioms": [],
+        },
+        "automation": {
+            "methods": [{
+                "method": "autonomous",
+                "models": used,
+                "framework": "mathforge",
+                "tool_setup": "Models proposed the claim, wrote Python search and re-check scripts that were "
+                              "executed, and wrote the Lean file, repaired against Lean's own errors; "
+                              "the axiom report was read with #print axioms.",
+                "cost": {"wall_time": "not tracked", "spend_usd": "not tracked",
+                         "hardware": "local machine (Python, Lean) and model APIs"},
+                "prompting_notes": "n/a",
+            }],
+            "spend_usd": "not tracked",
+            "notes": "Fully automated, no human in the loop; the operator only chose to publish.",
+        },
+        "fidelity": {"divergences": "; ".join(map(str, faith.get("differences") or [])) or "none known"},
+        "review": {
+            "status": "unreviewed",
+            "reviewers": ["none"],
+            "notes": "Automated checks only: executed scripts, Lean 4 + Mathlib, and a model's "
+                     "back-translation of the Lean statement.",
+        },
+        "alignment": {
+            "namespace": namespace,
+            "statements": [{
+                "source": claim,
+                "lean": f"{namespace}.{main}" if "." not in main else main,
+                "module": "Solution",
+                "status": "proved",
+                "note": "the negation of the claim" if refuted else "the claim as stated",
+            }],
+        },
+        "acknowledgements": "Lean 4 and Mathlib.",
+    })
+
+
+def _lakefile(package: str, lean_project: Path) -> str:
+    rev = re.search(r'^rev\s*=\s*"([^"]+)"', (lean_project / "lakefile.toml").read_text(encoding="utf-8"), re.M)
+    return (f'name = "{package}"\nversion = "0.1.0"\ndefaultTargets = ["Challenge", "Solution"]\n\n'
+            f'[[require]]\nname = "mathlib"\nscope = "leanprover-community"\nrev = "{rev.group(1) if rev else "master"}"\n\n'
+            '[[lean_lib]]\nname = "Challenge"\nroots = ["Challenge"]\n\n'
+            '[[lean_lib]]\nname = "Solution"\nroots = ["Solution"]\n')
+
+
+def palomar_bundle(forge: Forge, r: dict, folder: Path, classification: dict, maintainer: str) -> str:
+    """Write a Palomar-ready Lake project into `folder`; returns "" or why not.
+
+    Challenge and Solution are elaborated here first: a bundle that does not
+    compile is worse than none.
+    """
+    project, lean = forge.lean_project, r.get("lean") or {}
+    main = _main_theorem(r)
+    if not (project and lean.get("code") and main):
+        return "no Lean project or Lean file"
+    namespace = "Mathforge." + "".join(w.capitalize() for w in re.findall(r"[a-z0-9]+", folder.name))
     try:
-        proc = subprocess.run(
-            ["gh", "gist", "create", "--public", "--desc", desc, *(str(f) for f in files)],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            cwd=str(run.path),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        challenge, solution, qualified = palomar_split(lean["code"], main, namespace)
+    except ValueError as exc:
+        return str(exc)
+    scratch = forge.run.path / f"{r['id']}_palomar"
+    scratch.mkdir(exist_ok=True)
+    rc, out = run_lean(challenge, project, scratch, f"{r['id']}_Challenge")
+    if rc != 0:
+        return f"Challenge.lean does not elaborate: {_verdict_line(out)}"
+    rc, out = _run_lean_probed(solution, project, scratch, f"{r['id']}_Solution")
+    if not lean_verdict(solution, rc, out).get("sorry_free"):
+        return f"Solution.lean is not sorry-free after wrapping: {_verdict_line(out)}"
+    package = re.sub(r"[^A-Za-z0-9]", "", namespace.split(".")[-1])
+    files = {
+        "Challenge.lean": challenge,
+        "Solution.lean": solution,
+        "comparator.json": json.dumps({"challenge_module": "Challenge", "solution_module": "Solution",
+                                       "theorem_names": [qualified], "definition_names": [],
+                                       "permitted_axioms": sorted(STANDARD_AXIOMS)}, indent=2) + "\n",
+        "formalization.yaml": formalization_yaml(r, forge.run.data.get("models"), maintainer, namespace,
+                                                 qualified, classification),
+        "lakefile.toml": _lakefile(package, project),
+        "lean-toolchain": (project / "lean-toolchain").read_text(encoding="utf-8"),
+    }
+    manifest = project / "lake-manifest.json"
+    if manifest.exists():
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["name"] = package
+        files["lake-manifest.json"] = json.dumps(data, indent=1) + "\n"
+    for name, text in files.items():
+        (folder / name).write_text(text, encoding="utf-8")
+    return ""
+
+
+def _results_checkout() -> tuple[str, Path]:
+    """(owner/name, local checkout) of the public results repository, created on first use."""
+    repo = RESULTS_REPO
+    if "/" not in repo:
+        login = _gh("gh", "api", "user", "-q", ".login").stdout.strip()
+        if not login:
+            raise RuntimeError("gh is not logged in (gh auth login)")
+        repo = f"{login}/{repo}"
+    if not (RESULTS_CHECKOUT / ".git").exists():
+        if _gh("gh", "repo", "view", repo).returncode != 0:
+            made = _gh("gh", "repo", "create", repo, "--public", "--description",
+                       "Machine-checked results from mathforge, an automated conjecture-and-proof pipeline")
+            if made.returncode != 0:
+                raise RuntimeError(f"gh repo create {repo}: {(made.stdout + made.stderr).strip()[-300:]}")
+        cloned = _gh("gh", "repo", "clone", repo, str(RESULTS_CHECKOUT))
+        if cloned.returncode != 0:
+            raise RuntimeError(f"gh repo clone {repo}: {(cloned.stdout + cloned.stderr).strip()[-300:]}")
+        _gh("git", "checkout", "-B", "main", cwd=RESULTS_CHECKOUT)
+    _gh("git", "pull", "--ff-only", "origin", "main", cwd=RESULTS_CHECKOUT)  # fails harmlessly on an empty repo
+    return repo, RESULTS_CHECKOUT
+
+
+def results_index(checkout: Path, repo: str) -> str:
+    """The repository's front page: every published result, newest first."""
+    rows = []
+    for meta in checkout.glob("*/result.json"):
+        rows.append(json.loads(meta.read_text(encoding="utf-8")))
+    rows.sort(key=lambda m: (m.get("date", ""), m.get("folder", "")), reverse=True)
+    lines = [
+        "# mathforge results", "",
+        "Results from [mathforge](https://github.com/augusto-rehfeldt/mathforge), a fully automated "
+        "pipeline: language models propose conjectures, search for counterexamples, prove, and "
+        "formalize in Lean 4 + Mathlib. Only results Lean checked sorry-free are published here. "
+        "No person reviewed them; corrections are welcome as issues.", "",
+        "Each folder holds the write-up (`README.md`), the scripts that were run, and, where the "
+        "split succeeded, a Lake project ready for the [Palomar registry](https://palomar-registry.org/) "
+        "(`Challenge.lean`, `Solution.lean`, `comparator.json`, `formalization.yaml`).", "",
+        f"{len(rows)} result(s).", "",
+        "| Date | Verdict | Claim | Models | Palomar |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for m in rows:
+        claim = m.get("headline", "").split(": ", 1)[-1].replace("|", "\\|")
+        lines.append(f"| {m.get('date', '')} | {'false' if m.get('status') in REFUTED else 'true'} | "
+                     f"[{claim}]({m['folder']}/) | {m.get('models', '')} | {'bundle' if m.get('palomar') else '—'} |")
+    return "\n".join(lines) + "\n"
+
+
+def publish_result(forge: Forge, seed: str, r: dict) -> dict:
+    """Publish one result as a folder of the public results repository. Never
+    raises: publishing is a side effect of research, and a failed post must not
+    lose the result."""
+    if not shutil.which("gh") or not shutil.which("git"):
+        return {"error": "gh and git must be on PATH to publish"}
+    run, cid = forge.run, r["id"]
+    try:
+        with _REPO_LOCK:
+            repo, checkout = _results_checkout()
+            folder = checkout / f"{run.path.name[:48]}-{cid}"
+            folder.mkdir(exist_ok=True)
+            models = run.data.get("models")
+            # the generated artifacts are the point: a reader can re-run them
+            extras = ([f"{cid}_refute.lean", f"{cid}_falsify.py", f"{cid}_confirm.py"] if r["status"] in REFUTED
+                      else [f"{cid}_lean.lean", f"{cid}_falsify.py", f"{cid}_check.py"])
+            for name in extras:
+                if (run.path / name).exists():
+                    shutil.copy2(run.path / name, folder / name)
+            maintainer = _gh("git", "config", "user.name", cwd=checkout).stdout.strip() or "mathforge operator"
+            classification = run.stage(f"{cid}.classify", lambda: forge.classify(r))
+            why_not = palomar_bundle(forge, r, folder, classification, maintainer)
+            body = _publication(seed, r, models)
+            body += ("\n## Palomar\n\n" + (
+                f"This folder is a Lake project for the [Palomar registry](https://palomar-registry.org/). "
+                f"To submit it, use the [form]({PALOMAR_FORM}) with this repository, the commit, and "
+                f"`{folder.name}` as the project path. Read `Challenge.lean` against the statement first: "
+                "Palomar asks for human review, and none has been done."
+                if not why_not else f"No Palomar bundle: {why_not}.") + "\n")
+            (folder / "README.md").write_text(body, encoding="utf-8")
+            (folder / "result.json").write_text(json.dumps({
+                "folder": folder.name, "status": r["status"], "headline": headline(r),
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "models": models_used(r, models),
+                "palomar": not why_not, "run": run.path.name, "id": cid}, indent=2) + "\n", encoding="utf-8")
+            (checkout / "README.md").write_text(results_index(checkout, repo), encoding="utf-8")
+            # Palomar requires Apache-2.0, detected in the project directory; the
+            # code repo's own CC0 LICENSE is not it
+            for target in (checkout, folder):
+                shutil.copy2(HERE / "LICENSE-results", target / "LICENSE")
+            _gh("git", "add", "-A", cwd=checkout)
+            _gh("git", "commit", "-m", f"{headline(r)} ({r['status']})", cwd=checkout)
+            pushed = _gh("git", "push", "-u", "origin", "main", cwd=checkout)
+            if pushed.returncode != 0:
+                return {"error": f"git push: {(pushed.stdout + pushed.stderr).strip()[-300:]}"}
+    except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
-    url = _gist_url(proc.stdout)
-    if proc.returncode != 0 or not url:
-        return {"error": (proc.stdout + proc.stderr)[-500:].strip() or f"exit {proc.returncode}"}
-    return {"url": url, "status": r["status"], "title": r.get("title", cid), "files": [f.name for f in files]}
+    if why_not:
+        log(f"no Palomar bundle: {why_not}", cid)
+    return {"url": f"https://github.com/{repo}/tree/main/{folder.name}", "status": r["status"],
+            "title": r.get("title", cid), "palomar": not why_not}
 
 
-def publish(run: Run, seed: str, results: list) -> list:
+def publish(forge: Forge, seed: str, results: list) -> list:
     """Publish every qualifying result once. Cached in state.json, so a --resume
-    of a published run re-reads the URL instead of posting a duplicate gist."""
-    published = []
+    of a published run re-reads the URL instead of publishing it again."""
+    run, published = forge.run, []
     for r in results:
-        key = f"{r['id']}.gist"
+        key = f"{r['id']}.published"
         if not publishable(r):
-            stale = (run.data.get(key) or {}).get("url")
-            if stale:
-                log(f"PUBLIC gist {stale} no longer qualifies (now `{r['status']}`); retract it", r["id"])
+            for old in (key, f"{r['id']}.gist"):
+                stale = (run.data.get(old) or {}).get("url")
+                if stale:
+                    log(f"PUBLIC {stale} no longer qualifies (now `{r['status']}`); retract it", r["id"])
             continue
         # a failed post is not a result: drop it so --resume retries instead of
         # caching the error forever
         if not (run.data.get(key) or {}).get("url"):
             run.data.pop(key, None)
-        info = run.stage(key, lambda r=r: publish_gist(run, seed, r))
+        info = run.stage(key, lambda r=r: publish_result(forge, seed, r))
         if info.get("url"):
             log(f"published `{r['status']}`: {info['url']}", r["id"])
             published.append(info)
@@ -1873,8 +2190,8 @@ def publish_verdict(enabled: bool, results: list, published: list) -> str:
     if not qualifying:
         return f"publish: NOTHING PUBLISHED, no result qualified ({rule_})"
     if len(published) < qualifying:
-        return f"publish: {len(published)}/{qualifying} posted, rest failed; --resume retries them"
-    return f"publish: {len(published)} gist(s) posted"
+        return f"publish: {len(published)}/{qualifying} published, rest failed; --resume retries them"
+    return f"publish: {len(published)} result(s) published"
 
 
 def latest_run_dir() -> Path | None:
@@ -1966,7 +2283,7 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
 
     keepers = [r for r in results if r["status"] in ("machine-verified", "verified", "provisional")]
     if len(keepers) < len(results):
-        (run.path / "negative_results.md").write_text(negative_results(seed, results), encoding="utf-8")
+        (run.path / "negative_results.md").write_text(negative_results(seed, results, run.data.get("models")), encoding="utf-8")
         vlog(f"negative results: {run.path / 'negative_results.md'}")
 
     paper_path = None
@@ -1979,10 +2296,13 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
             run.data.pop("paper", None)
         run.data["paper_keepers"] = kept
         paper = run.stage("paper", lambda: forge.paper(seed, [_for_paper(r) for r in keepers]))
-        (run.path / "paper.md").write_text(paper, encoding="utf-8")
+        # appended at write time, not cached: the paper model cannot misreport it,
+        # and papers cached before this existed gain it on --resume
+        (run.path / "paper.md").write_text(paper.rstrip() + "\n\n" + paper_models(keepers, run.data.get("models")),
+                                           encoding="utf-8")
         paper_path = run.path / "paper.md"
 
-    published = publish(run, seed, results) if getattr(args, "publish", False) else []
+    published = publish(forge, seed, results) if getattr(args, "publish", False) else []
 
     elapsed = time.time() - started
     order = ("machine-verified", "verified", "provisional", "known", "machine-refuted", "refuted",
@@ -2067,7 +2387,13 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--publish",
         action="store_true",
-        help="post every machine-verified result and every counterexample as a PUBLIC GitHub gist (needs `gh` logged in)",
+        help="publish every machine-verified and machine-refuted result as a folder of the PUBLIC "
+             "GitHub repository MATHFORGE_RESULTS_REPO (default mathforge-results; needs `gh` logged in)",
+    )
+    ap.add_argument(
+        "--publish-existing",
+        action="store_true",
+        help="publish every qualifying result already under math_output (each once; see --publish) and exit",
     )
     ap.add_argument(
         "--setup-lean",
@@ -2088,7 +2414,7 @@ def main(argv=None) -> int:
     if args.setup_lean:
         return setup_lean(Path(args.lean_project) if args.lean_project else DEFAULT_LEAN_PROJECT)
 
-    if not (args.seed or args.resume or args.forever or args.runs > 1):
+    if not (args.seed or args.resume or args.forever or args.runs > 1 or args.publish_existing):
         ap.error("give a seed topic, --resume a run directory, or --forever")
 
     lean_project = None if args.no_lean else find_lean_project(args.lean_project)
@@ -2140,11 +2466,22 @@ def main(argv=None) -> int:
         f"{args.conjectures} conjectures each, {args.workers} worker(s)")
     vlog(f"lean        {lean_project or ('disabled (--no-lean)' if args.no_lean else 'no Mathlib project found; run --setup-lean')}")
     vlog(f"novelty     {'arXiv + Crossref + OpenAlex' + (' + Semantic Scholar' if os.getenv('S2_API_KEY') else '') if not args.no_search else 'disabled (--no-search)'}")
-    vlog(f"publish     {'PUBLIC gists for machine-verified results and counterexamples' if args.publish else 'off'}")
+    vlog(f"publish     {'PUBLIC results repository ' + RESULTS_REPO if args.publish else 'off'}")
     vlog(f"library     {OUTPUT_ROOT}")
 
     def forge_for(run: Run) -> Forge:
         return Forge(ai, run, lean_project, search=not args.no_search)
+
+    if args.publish_existing:
+        runs = sorted(p.parent for p in OUTPUT_ROOT.glob("*/state.json") if not p.parent.name.startswith("_"))
+        count = 0
+        for path in runs:
+            run = Run(path)
+            results = run.data.get("results") or []
+            if any(publishable(r) for r in results):
+                count += len(publish(forge_for(run), run.data.get("seed", path.name), results))
+        log(f"publish: {count} result(s) published from {len(runs)} run(s)")
+        return 0
 
     if args.resume:
         path = latest_run_dir() if args.resume == "latest" else Path(args.resume)
@@ -2689,12 +3026,32 @@ def _selftest() -> None:
     mixed = [{"status": "verified"}, {"status": "machine-refuted"}]
     assert publish_verdict(False, mixed, []).startswith("publish: OFF") and "1 result" in publish_verdict(False, mixed, [])
     assert "NOTHING PUBLISHED" in publish_verdict(True, [{"status": "verified"}, {"status": "known"}], [])
-    assert "0/1 posted" in publish_verdict(True, mixed, [])
-    assert publish_verdict(True, mixed, [{"url": "u"}]) == "publish: 1 gist(s) posted"
+    assert "0/1 published" in publish_verdict(True, mixed, [])
+    assert publish_verdict(True, mixed, [{"url": "u"}]) == "publish: 1 result(s) published"
     assert _counterexample_line("checks ok\nNO COUNTEREXAMPLE here\nCOUNTEREXAMPLE: n=7") == "COUNTEREXAMPLE: n=7"
     assert _counterexample_line("NO COUNTEREXAMPLE up to 10^6") == ""
-    assert _gist_url("Creating gist\nhttps://gist.github.com/u/abc123\n") == "https://gist.github.com/u/abc123"
-    assert _gist_url("nothing here") == ""
+
+    # Palomar split: Challenge keeps every definition (made public: a private name
+    # is mangled per module) and states only the main theorem, with one sorry
+    lean_src = ("import Mathlib\n\nset_option maxRecDepth 2048\n\nprivate def f (n : ℕ) : ℕ := n + 1\n\n"
+                "lemma helper : f 1 = 2 := by decide\n\n-- FAITHFULNESS: f is the successor.\n"
+                "theorem refutation :\n    ¬ (∀ n, f n = n) := by\n  intro h\n  have := h 0\n  simp [f] at this\n"
+                "set_option pp.fullNames true in\n#print axioms refutation\n")
+    challenge, solution, qualified = palomar_split(lean_src, "refutation", "Mathforge.T")
+    assert qualified == "Mathforge.T.refutation", qualified
+    assert "def f" in challenge and "private" not in challenge + solution and "helper" not in challenge
+    assert "-- FAITHFULNESS" in challenge and challenge.count("sorry") == 1 and "¬ (∀ n, f n = n) := by\n  sorry" in challenge
+    assert "lemma helper" in solution and "#print" not in solution and "set_option maxRecDepth" in solution
+    assert solution.startswith("import Mathlib\n\nnamespace Mathforge.T\n") and solution.endswith("end Mathforge.T\n")
+    assert _main_theorem({"status": "machine-verified", "lean": {"code": "theorem a : True := trivial\n"
+                                                                  "theorem main_theorem : True := trivial\n"
+                                                                  "theorem b : True := trivial"}}) == "main_theorem"
+    yml = formalization_yaml({"id": "c1", "status": "machine-refuted", "statement": "Every n is odd.", "title": "T"},
+                             {"work": "w", "review": "r"}, "Op", "Mathforge.T", "Mathforge.T.refutation",
+                             {"arxiv": ["math.CO"], "msc2020": ["05A15"]})
+    assert 'type: "original-proof"' in yml and 'models:\n        - "r"\n        - "w"' in yml, yml
+    assert "sorry_count: 0" in yml and "axioms: []" in yml and 'lean: "Mathforge.T.refutation"' in yml
+    assert "TEMPLATE" not in yml
 
     negation = _publication("seed", {
         "id": "c1", "title": "Broken", "headline": "Every n is odd.", "status": "machine-refuted",
@@ -2722,23 +3079,38 @@ def _selftest() -> None:
     assert "- Independent re-check of the witness: checker-x" in credited
     assert "- Counterexample search: work-y" in credited and "- Proposed the claim: review-z" in credited
     assert "- Wrote the proof: not recorded" in proved
+    # the credit line sits under the verdict, distinct models in pipeline order
+    assert "**Models:** review-z, work-y, checker-x" in credited, credited[:300]
+    assert "**Models:** not recorded" in proved
+    paper_credit = paper_models([{"id": "c2", "title": "Kept", "status": "verified"}], {"work": "w", "review": "r"})
+    assert paper_credit.startswith("## Models") and "- Wrote the proof: w" in paper_credit
+    assert "- Referee: r" in paper_credit
 
     pub_run = Run(OUTPUT_ROOT / "_publishtest")
+    pub_forge = Forge(None, pub_run)
     posts = []
-    real_publish_gist = globals()["publish_gist"]
-    globals()["publish_gist"] = lambda run, seed, r: (
+    real_publish_result = globals()["publish_result"]
+    globals()["publish_result"] = lambda forge, seed, r: (
         posts.append(r["id"]),
-        {"error": "offline"} if len(posts) == 1 else {"url": "https://gist.github.com/x", "title": r["id"]},
+        {"error": "offline"} if len(posts) == 1 else {"url": "https://github.com/u/mathforge-results/tree/main/x",
+                                                      "title": r["id"]},
     )[1]
     try:
         one = {"id": "c1", "status": "machine-refuted", "statement": "s"}
-        assert publish(pub_run, "seed", [one, {"id": "c2", "status": "known"}]) == []
-        assert publish(pub_run, "seed", [one])[0]["url"] == "https://gist.github.com/x"
-        assert publish(pub_run, "seed", [one])  # cached, no third post
+        assert publish(pub_forge, "seed", [one, {"id": "c2", "status": "known"}]) == []
+        assert publish(pub_forge, "seed", [one])[0]["url"].endswith("/tree/main/x")
+        assert publish(pub_forge, "seed", [one])  # cached, no third post
         assert posts == ["c1", "c1"], posts
     finally:
-        globals()["publish_gist"] = real_publish_gist
+        globals()["publish_result"] = real_publish_result
         shutil.rmtree(pub_run.path, ignore_errors=True)
+    listing = tmp / "_results"
+    (listing / "a-c1").mkdir(parents=True, exist_ok=True)
+    (listing / "a-c1" / "result.json").write_text(json.dumps({
+        "folder": "a-c1", "status": "machine-refuted", "headline": "Refuted: x | y", "date": "2026-09-27",
+        "models": "m", "palomar": True}), encoding="utf-8")
+    front = results_index(listing, "u/r")
+    assert "1 result(s)" in front and "| 2026-09-27 | false | [x \\| y](a-c1/) | m | bundle |" in front, front
 
     # continuous mode bookkeeping
     real_root = globals()["OUTPUT_ROOT"]

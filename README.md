@@ -49,7 +49,8 @@ python mathforge.py "seed topic" --conjectures 5 --workers 3
 python mathforge.py --forever --workers 4      # picks its own topics, paper after paper
 python mathforge.py --runs 10 --pause 300      # ten papers, five minutes apart
 python mathforge.py --resume math_output/<slug>
-python mathforge.py --forever --publish        # public gist per machine-checked result
+python mathforge.py --forever --publish        # publish each machine-checked result
+python mathforge.py --publish-existing         # publish results already on disk
 python mathforge.py --selftest                 # offline, no API calls
 ```
 
@@ -69,27 +70,40 @@ both are normally thrown away, and neither is expensive to keep.
 
 ### Publishing
 
-`--publish` posts a **public** GitHub gist for each result whose status comes
-from a machine verdict rather than a model's opinion: `machine-verified` (Lean
-compiled it sorry-free and the back-translation was faithful) and
-`machine-refuted` (a counterexample re-checked by a second model's script, with
-the negation proved in Lean). A bare `refuted` is not published: four
-single-script "counterexamples" posted in September 2026 were false. Nothing
-else is published, and nothing at all without the flag.
+`--publish` publishes each result whose status comes from a machine verdict
+rather than a model's opinion: `machine-verified` (Lean compiled it sorry-free
+and the back-translation was faithful) and `machine-refuted` (a counterexample
+re-checked by a separate model call's script, with the negation proved in Lean).
+A bare `refuted` is not published: four single-script "counterexamples" posted in
+September 2026 were false. Nothing else is published, and nothing at all without
+the flag. `--publish-existing` publishes every qualifying result already under
+`math_output/` and exits.
 
-A gist's title leads with the verdict and the claim in one sentence —
-`Refuted: …` / `Proved: …`, from the proposer's `headline` field — and the body
-opens with a `Verdict:` line before the full statement.
+Results go to one public GitHub repository, `<you>/mathforge-results` (override
+with `MATHFORGE_RESULTS_REPO`, local checkout `~/mathforge-results` or
+`MATHFORGE_RESULTS_DIR`), created on first use. Its README is an index table of
+every result: date, verdict, claim, models. Each result is a folder with:
 
-Each gist carries the statement, the proof or the counterexample, the
-verification detail, and the generated `.lean` / `.py` artifacts so a reader can
-re-run them — plus a header stating that this is an unreviewed automated
-artifact and may be a rediscovery. Gist URLs are recorded in `state.json` and in
-`math_output/index.md`; a resumed run reuses the URL instead of posting twice,
-and a failed post is retried on the next resume.
+- `README.md` — `Refuted: …` / `Proved: …` title, verdict, the models that did the
+  work, statement, proof or counterexample, verification detail, and a note that
+  this is an unreviewed automated artifact that may be a rediscovery;
+- the generated `.lean` / `.py` artifacts, so a reader can re-run them;
+- a [Palomar](https://palomar-registry.org/) Lake project: `Challenge.lean` (the
+  definitions and the main theorem with `sorry`), `Solution.lean` (the checked
+  file), `comparator.json`, `formalization.yaml`, `lakefile.toml`,
+  `lean-toolchain`, `lake-manifest.json`. Both Lean files are elaborated before
+  the bundle is written; when the split fails, the README says why.
 
-Requires the GitHub CLI logged in (`gh auth login`). Note that a gist is public
-the moment it is created, before anyone has read it.
+Palomar is a registry of Lean-verified mathematics that accepts AI-generated
+work. mathforge does not submit to it: Palomar asks for human review and applies
+a research-interest floor. To submit a folder, read its `Challenge.lean` against
+the statement, then use https://submit.palomar-registry.org/ with the repository,
+the commit and the folder as project path.
+
+Published URLs are recorded in `state.json` and in `math_output/index.md`; a
+resumed run reuses the URL instead of publishing twice, and a failed publish is
+retried on the next resume. Requires the GitHub CLI logged in (`gh auth login`).
+A published folder is public the moment it is pushed, before anyone has read it.
 
 ### Lean
 
