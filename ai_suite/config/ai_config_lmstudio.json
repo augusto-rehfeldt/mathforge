@@ -1,0 +1,17 @@
+{
+  "provider": "openrouter",
+  "use_openai_client": true,
+  "token_param": "max_tokens",
+  "usage_state_path": "book_output/ai_usage_state.json",
+  "timeout": 900,
+  "writing_model": "openai/gpt-oss-20b",
+  "review_model": "openai/gpt-oss-20b",
+  "base_url": "http://127.0.0.1:1234/v1",
+  "api_key_env": "LMSTUDIO_API_KEY",
+  "models": {
+    "openai/gpt-oss-20b": {
+      "name": "GPT-OSS 20B (local)",
+      "max_output": 32768
+    }
+  }
+}

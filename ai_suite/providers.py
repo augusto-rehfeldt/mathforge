@@ -19,7 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from .service import ensure_openai_oauth_proxy, load_opencode_go_sync
+from .service import ensure_openai_oauth_proxy, load_opencode_go_sync, background_process_options
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -39,12 +39,30 @@ PROVIDER_CONFIG_MAP = {
     "hyper": str(PACKAGE_ROOT / "config" / "ai_config_hyper.json"),
     "grok": str(PACKAGE_ROOT / "config" / "ai_config_grok.json"),
     "nvidia": str(PACKAGE_ROOT / "config" / "ai_config_nvidia.json"),
+    "gpt4free": str(PACKAGE_ROOT / "config" / "ai_config_gpt4free.json"),
+    "cerebras": str(PACKAGE_ROOT / "config" / "ai_config_cerebras.json"),
+    "mistral": str(PACKAGE_ROOT / "config" / "ai_config_mistral.json"),
+    "cloudflare": str(PACKAGE_ROOT / "config" / "ai_config_cloudflare.json"),
+    "sambanova": str(PACKAGE_ROOT / "config" / "ai_config_sambanova.json"),
+    "chutes": str(PACKAGE_ROOT / "config" / "ai_config_chutes.json"),
+    "pollinations": str(PACKAGE_ROOT / "config" / "ai_config_pollinations.json"),
+    "ollama": str(PACKAGE_ROOT / "config" / "ai_config_ollama.json"),
+    "lmstudio": str(PACKAGE_ROOT / "config" / "ai_config_lmstudio.json"),
 }
 # Providers whose model list lives in their config file and is picked at runtime.
-CATALOGUE_PROVIDERS = ("opencode-go", "opencode-zen", "claude", "commandcode", "hyper", "grok", "nvidia")
+CATALOGUE_PROVIDERS = ("opencode-go", "opencode-zen", "claude", "commandcode", "hyper", "grok", "nvidia", "gpt4free",
+                       "cerebras", "mistral", "cloudflare", "sambanova", "chutes", "pollinations",
+                       "ollama", "lmstudio")
+# Local servers: the menu offers whatever they have loaded, whatever models.dev knows.
+LOCAL_PROVIDERS = ("ollama", "lmstudio")
+# Cap sent to a local model models.dev can't size.
+LOCAL_MAX_OUTPUT = 32768
+# Chat runs through the provider's own CLI, which lists only chat models.
+CLI_PROVIDERS = ("commandcode", "opencode-zen")
 # Where choose_ai remembers the last picks when a caller names no state file.
 PROVIDER_STATE_FILE = REPO_ROOT / "provider_state.json"
-OPENAI_MODEL_OPTIONS = ("gpt-5.4", "gpt-5.4-mini")
+# Offline fallback for the OpenAI API menu; online it lists what /v1/models serves.
+OPENAI_MODEL_OPTIONS = ("gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna")
 
 # models.dev publishes each model's context/output limits and list price per 1M
 # tokens; opencode keeps a copy of it on disk. Sources are searched in order.
@@ -66,12 +84,30 @@ MODELS_DEV_SOURCES = {
     "hyper": ("hyper",),
     "grok": ("xai",),
     "nvidia": ("nvidia",),
+    # gpt4free names models its own way ("qwen-3-235b"), so _gpt4free_facts matches
+    # them to any models.dev entry by name shape; these makers' own listings win ties.
+    "gpt4free": ("openai", "anthropic", "google", "deepseek", "xai", "mistral", "alibaba",
+                 "moonshotai", "zai", "minimax", "meta", "cohere", "perplexity", "nvidia",
+                 "stepfun", "thinkingmachines", "openrouter"),
+    "cerebras": ("cerebras",),
+    "mistral": ("mistral",),
+    "cloudflare": ("cloudflare-workers-ai",),
+    "sambanova": ("sambanova", "openrouter"),
+    "chutes": ("chutes", "openrouter"),
+    "pollinations": ("openrouter",),
+    "ollama": ("openrouter",),
+    "lmstudio": ("openrouter",),
 }
-# Artificial Analysis Intelligence Index per model, cached a day like models.dev.
+# Artificial Analysis Intelligence Index per model, refetched on load once the disk
+# copy is AA_REFRESH_DAYS old (default 1).
+AA_REFRESH_DAYS = float(os.environ.get("AA_REFRESH_DAYS") or 1)
 AA_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 AA_CACHE = Path.home() / ".cache" / "ai-book-creator" / "artificial_analysis.json"
 # `cmdc --list-models` takes 5-25 s, so its listing is reused for a day.
 CMDC_MODELS_CACHE = Path.home() / ".cache" / "ai-book-creator" / "cmdc_models.txt"
+# Zen chat runs through the OpenCode CLI, whose own listing drops ids the gateway's
+# /models still names but no longer serves (deepseek-v4-flash-free).
+OPENCODE_MODELS_CACHE = Path.home() / ".cache" / "ai-book-creator" / "opencode_models.txt"
 # Slug words that only name a reasoning setting or release channel.
 AA_VARIANT_WORDS = frozenset(
     "thinking reasoning nonreasoning non adaptive preview exp low medium high xhigh max minimal".split()
@@ -109,12 +145,12 @@ def _models_dev() -> dict:
 
 @lru_cache(maxsize=None)
 def _artificial_analysis() -> list:
-    """Artificial Analysis model list: disk copy if under a day old, else live, else stale.
+    """Artificial Analysis model list: disk copy if under AA_REFRESH_DAYS old, else live, else stale.
 
     Needs a free key in ARTIFICIAL_ANALYSIS_API_KEY; without one, returns [].
     """
     try:
-        if time.time() - AA_CACHE.stat().st_mtime < 86400:
+        if time.time() - AA_CACHE.stat().st_mtime < AA_REFRESH_DAYS * 86400:
             return json.loads(AA_CACHE.read_text(encoding="utf-8"))
     except Exception:
         pass
@@ -141,7 +177,9 @@ def _name_key(name: str) -> tuple[tuple[str, ...], frozenset[str]]:
 
     Numbers keep their order (gpt-5.4 is not gpt-4.5); words don't.
     """
-    parts = [p for p in re.split(r"[^a-z0-9]+", name.lower()) if p and p not in ("free", "contributor")]
+    # "qwen3-5" and "qwen-3.5" are one model: split a glued family name off its version.
+    name = re.sub(r"([a-z]{2,})(\d)", r"\1-\2", name.lower())
+    parts = [p for p in re.split(r"[^a-z0-9]+", name) if p and p not in ("free", "contributor")]
     return (tuple(p for p in parts if p.isdigit()), frozenset(p for p in parts if not p.isdigit()))
 
 
@@ -178,7 +216,44 @@ def _model_facts(provider: str, mid: str) -> dict:
     return {**info, "intelligence": score} if score is not None else info
 
 
+@lru_cache(maxsize=None)
+def _models_dev_index() -> dict:
+    """Every models.dev entry by _name_key numbers: [(words, source rank, info)]."""
+    rank = {source: i for i, source in enumerate(MODELS_DEV_SOURCES["gpt4free"])}
+    index: dict = {}
+    for source, data in _models_dev().items():
+        for key, info in ((data or {}).get("models") or {}).items():
+            numbers, words = _name_key(key.rsplit("/", 1)[-1])
+            index.setdefault(numbers, []).append((words, rank.get(source, len(rank)), info))
+    return index
+
+
+def _gpt4free_facts(mid: str) -> dict:
+    """models.dev facts for a g4f name, priced free: g4f bills nothing.
+
+    Matches like _intelligence: same version numbers, the g4f words all present, and
+    extras only variant words, "instruct"/"it" or parameter counts. Fewest extras win,
+    then the maker's own listing.
+    """
+    numbers, words = _name_key(mid.rsplit("/", 1)[-1])
+    best = None
+    for e_words, rank, info in _models_dev_index().get(numbers, ()):
+        extra = e_words - words
+        if not words <= e_words or not all(
+                w in AA_VARIANT_WORDS or w in ("instruct", "it") or re.fullmatch(r"a?\d+[be]", w)
+                for w in extra):
+            continue
+        key = (len(extra), rank)
+        if best is None or key < best[0]:
+            best = (key, info)
+    if best is None:
+        return {}
+    return {**best[1], "cost": {"input": 0, "output": 0}}
+
+
 def _models_dev_facts(provider: str, mid: str) -> dict:
+    if provider == "gpt4free":
+        return _gpt4free_facts(mid)
     mid = mid.lower()
     tail = mid.rsplit("/", 1)[-1]
     for source in MODELS_DEV_SOURCES.get(provider, ()):
@@ -275,33 +350,60 @@ def _cost_key(info: dict) -> tuple:
     return (0, cost["output"], cost["input"])
 
 
+def _enable_ansi() -> None:
+    """Enable console escapes without spawning cmd.exe for every label."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        kernel.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        mode = wintypes.DWORD()
+        handle = kernel.GetStdHandle(-11)
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel.SetConsoleMode(handle, mode.value | 0x0004)
+
+
 def _color(text: str, code: str) -> str:
     """ANSI-colored text on a terminal; plain when piped or NO_COLOR is set."""
     if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
         return text
-    os.system("")  # turns on ANSI escape handling in the Windows console
+    _enable_ansi()
     return f"\033[{code}m{text}\033[0m"
+
+
+def _cli_listing(args: list[str], cache: Path) -> str:
+    """A CLI's model listing, reused for a day."""
+    try:
+        if time.time() - cache.stat().st_mtime < 86400:
+            return cache.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    listing = subprocess.run(
+        [shutil.which(args[0]) or args[0], *args[1:]],
+        capture_output=True, text=True, encoding="utf-8", timeout=15, check=True,
+        **background_process_options(),
+    ).stdout
+    if listing.strip():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(listing, encoding="utf-8")
+    return listing
 
 
 def _live_model_ids(provider: str) -> set[str] | None:
     """Model ids the provider serves right now, or None when it can't be asked."""
     try:
         if provider == "commandcode":
-            try:
-                fresh = time.time() - CMDC_MODELS_CACHE.stat().st_mtime < 86400
-            except OSError:
-                fresh = False
-            if fresh:
-                listing = CMDC_MODELS_CACHE.read_text(encoding="utf-8")
-            else:
-                listing = subprocess.run(
-                    [shutil.which("cmdc") or "cmdc", "--list-models"],
-                    capture_output=True, text=True, encoding="utf-8", timeout=15, check=True,
-                ).stdout
-                if listing.strip():
-                    CMDC_MODELS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-                    CMDC_MODELS_CACHE.write_text(listing, encoding="utf-8")
-            return {line.split()[0].lower() for line in listing.splitlines() if line.strip()} or None
+            listing = _cli_listing(["cmdc", "--list-models"], CMDC_MODELS_CACHE)
+            # Model rows start at column 0 with an id; headings ("Available models", "Open
+            # Source") have no dash or slash in their first word.
+            return {word.lower() for word in (line.split()[0] for line in listing.splitlines()
+                    if line.strip() and not line[0].isspace()) if "-" in word or "/" in word} or None
+        if provider == "opencode-zen":
+            listing = _cli_listing(["opencode", "models", "opencode"], OPENCODE_MODELS_CACHE)
+            return {line.strip().split("/", 1)[1].lower() for line in listing.splitlines()
+                    if line.strip().startswith("opencode/")} or None
         with open(PROVIDER_CONFIG_MAP[provider], "r", encoding="utf-8") as f:
             data = json.load(f)
         if not data.get("base_url"):
@@ -313,7 +415,9 @@ def _live_model_ids(provider: str) -> set[str] | None:
         if key:
             req.add_header("Authorization", f"Bearer {key}")
         with urlopen(req, timeout=5) as resp:
-            return {str(m["id"]).lower() for m in json.load(resp)["data"]}
+            # gpt4free also lists each backend (provider: true) and image models.
+            return {str(m["id"]).lower() for m in json.load(resp)["data"]
+                    if not m.get("provider") and not m.get("image")}
     except Exception:
         return None
 
@@ -337,19 +441,22 @@ def _load_catalogue(provider: str) -> dict:
     # Drop curated ids the provider has retired, so the menu never offers a
     # dead model. Offline or unreachable: keep the curated list as is.
     live = _live_model_ids(provider) if provider != "claude" else None
-    if live and any(mid in live for mid in out):
+    if live and (provider in LOCAL_PROVIDERS or any(mid in live for mid in out)):
         out = {mid: entry for mid, entry in out.items() if mid in live}
         # And offer what the provider added since the list was curated, when
-        # models.dev can say how much it writes (skips image/embedding ids).
+        # models.dev can say how much it writes (skips image/embedding ids). The
+        # CLI providers list only chat models and take no cap, so all of theirs join.
         for mid in sorted(live - set(out)):
             max_out = int((_model_facts(provider, mid).get("limit") or {}).get("output") or 0)
-            if max_out:
-                out[mid] = [mid, max_out]
+            if provider in LOCAL_PROVIDERS:
+                max_out = max_out or LOCAL_MAX_OUTPUT
+            if max_out or provider in CLI_PROVIDERS:
+                out[mid] = [mid, 0 if provider == "commandcode" else max_out]
     if not out:
         fallback = (
-            {"deepseek-v4-flash-free": ["DeepSeek V4 Flash Free", 128000]}
+            {"nemotron-3-ultra-free": ["Nemotron 3 Ultra Free", 128000]}
             if provider == "opencode-zen"
-            else {"glm-5.2": ["GLM-5.2", 131072]}
+            else {"glm-5.3": ["GLM-5.3", 131072]}
         )
         out = fallback
     return out
@@ -403,7 +510,7 @@ def _default_openai_model() -> str:
                 return candidate
     except Exception:
         pass
-    return "gpt-5.4-mini"
+    return "gpt-6-luna"
 
 
 def _load_last_openai_model(
@@ -470,15 +577,30 @@ def _prompt_provider(default_provider: str) -> str:
 
 def _normalize_openai_model(choice: str) -> str:
     normalized = choice.strip().lower()
-    aliases = {
-        "1": "gpt-5.4",
-        "gpt-5.4": "gpt-5.4",
-        "5.4": "gpt-5.4",
-        "2": "gpt-5.4-mini",
-        "gpt-5.4-mini": "gpt-5.4-mini",
-        "mini": "gpt-5.4-mini",
-    }
-    return aliases.get(normalized, "")
+    if normalized.isdigit() and 1 <= int(normalized) <= len(OPENAI_MODEL_OPTIONS):
+        return OPENAI_MODEL_OPTIONS[int(normalized) - 1]
+    return normalized if normalized in OPENAI_MODEL_OPTIONS else ""
+
+
+def _load_openai_api_models() -> dict[str, tuple[int | None, int | None]] | None:
+    """Text models the OpenAI API serves now; None without a key or offline."""
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        req = Request("https://api.openai.com/v1/models",
+                      headers={"Authorization": f"Bearer {key}", "User-Agent": "ai-book-creator"})
+        with urlopen(req, timeout=10) as resp:
+            ids = sorted(str(m["id"]) for m in json.load(resp)["data"])
+    except Exception:
+        return None
+    # Dated snapshots repeat their alias; audio, realtime, embedding and the rest are
+    # not chat-completion text models, and -pro ids answer only the Responses API.
+    # models.dev's output limit screens out anything else it does not know.
+    skip = re.compile(r"-\d{4}-\d{2}-\d{2}$|audio|realtime|search|transcribe|tts|image|embedding|codex|chat-latest|deep-research|-pro$")
+    models = {mid: (None, None) for mid in ids if not skip.search(mid)
+              and (_model_facts("openai", mid).get("limit") or {}).get("output")}
+    return models or None
 
 
 def _load_openai_oauth_models() -> dict[str, tuple[int | None, int | None]]:
@@ -505,6 +627,7 @@ def _prompt_openai_model(
     default_model: str,
     model_info: dict[str, tuple[int | None, int | None]] | None = None,
     role: str = "",
+    oauth: bool = True,
 ) -> str:
     options = tuple(model_info) if model_info is not None else OPENAI_MODEL_OPTIONS
     rows = []
@@ -514,8 +637,10 @@ def _prompt_openai_model(
         # The OAuth endpoint's own figures win over models.dev when it reports them.
         reported = {k: v for k, v in (("context", context), ("output", output)) if v}
         rows.append((model, {**info, "limit": {**(info.get("limit") or {}), **reported}}))
-    title = "OpenAI via ChatGPT sign-in (live)" if model_info is not None else "OpenAI"
-    paid_by = "; your ChatGPT subscription pays" if model_info is not None else ""
+    oauth = oauth and model_info is not None
+    title = ("OpenAI via ChatGPT sign-in (live)" if oauth
+             else "OpenAI (live)" if model_info is not None else "OpenAI")
+    paid_by = "; your ChatGPT subscription pays" if oauth else ""
     return _pick_model(title, rows, default_model, role, paid_by,
                        None if model_info is not None else _normalize_openai_model)
 
@@ -560,7 +685,7 @@ def _loading(what: str):
     if not sys.stdout.isatty():
         yield
         return
-    os.system("")  # ANSI erase codes on the Windows console, even under NO_COLOR
+    _enable_ansi()
     label = _BelowLabel(sys.stdout, _color(f"Loading {what}...", "2"))
     label.show()
     sys.stdout = label
@@ -572,13 +697,16 @@ def _loading(what: str):
 
 
 def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: str = "",
-                sorts: list[tuple[str, list[str]]] | None = None, name: str = "") -> str | None:
+                sorts: list[tuple[str, list[str]]] | None = None, name: str = "",
+                multi: bool = False) -> str | None:
     """Arrow-key menu on a Windows console, MENU_ROWS rows at a time.
 
     Up/Down (or W/S)/PgUp/PgDn/Home/End move, Space selects or deselects the row under the
     cursor, Enter confirms the selection (the cursor row when nothing is selected),
     Esc keeps the default, Tab cycles `sorts` [(name, ids in order)]. Opens with the
     default selected. On confirm the menu collapses to one "<name>: <pick>" line.
+    multi=True: Space toggles rows, numbered in the order picked; default and result are
+    comma-joined ids in that order, and Enter with nothing picked returns "".
     Returns None off a console so callers fall back to typing.
     """
     if os.name != "nt" or not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -588,10 +716,10 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
     text = dict(rows)
     sorts = sorts or [("", [rid for rid, _ in rows])]
     sort = 0
-    selected = default if default in text else None
-    cur = sorts[0][1].index(selected) if selected else 0
+    picks = [d for d in (default.split(",") if multi else [default]) if d in text]
+    cur = sorts[0][1].index(picks[0]) if picks else 0
     top = drawn = 0
-    os.system("")  # ANSI cursor codes on the Windows console
+    _enable_ansi()
     keys = "↑↓/W S move · Space select · Enter confirm · Esc default"
     if len(sorts) > 1:
         keys += " · Tab sort"
@@ -603,7 +731,8 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
         drawn = len(lines)
 
     def done(picked: str) -> str:
-        redraw([f"{_color('✓', '32')} {name or title.rstrip(':')}: {_color(picked, '1')}"])
+        shown = picked.replace(",", ", ") if picked or not multi else "none"
+        redraw([f"{_color('✓', '32')} {name or title.rstrip(':')}: {_color(shown, '1')}"])
         return picked
 
     while True:
@@ -613,7 +742,8 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
         sorted_by = f"  sorted by {sorts[sort][0]}" if len(sorts) > 1 else ""
         lines = [_color(title, "1") + _color(sorted_by, "2")]
         for i, rid in enumerate(shown):
-            row = f"[{'x' if rid == selected else ' '}] {text[rid]}"
+            mark = (str(picks.index(rid) + 1) if multi else "x") if rid in picks else " "
+            row = f"[{mark}] {text[rid]}"
             lines.append(_color(f"  > {row}", "1;36") if top + i == cur else f"    {row}")
         scroll = f"{top + 1}-{top + len(shown)} of {len(order)}"
         lines.append(_color(f"    {scroll} · {keys}", "2"))
@@ -627,9 +757,12 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
         elif ch in "wWsS":
             cur = min(max(cur + (-1 if ch in "wW" else 1), 0), len(order) - 1)
         elif ch == " ":
-            selected = None if selected == order[cur] else order[cur]
+            if order[cur] in picks:
+                picks.remove(order[cur])
+            else:
+                picks = [*picks, order[cur]] if multi else [order[cur]]
         elif ch in "\r\n":
-            return done(selected or order[cur])
+            return done(",".join(picks) if multi else (picks or [order[cur]])[0])
         elif ch == "\t" and len(sorts) > 1:
             sort = (sort + 1) % len(sorts)
             cur = sorts[sort][1].index(order[cur])
@@ -722,6 +855,15 @@ PROVIDER_LABELS = {
     "commandcode": "Command Code (your subscription, no API key)",
     "hyper": "hyper.charm.land",
     "grok": "xAI Grok",
+    "gpt4free": "gpt4free (local `g4f api` server, free)",
+    "cerebras": "Cerebras (free tier)",
+    "mistral": "Mistral La Plateforme (free Experiment tier)",
+    "cloudflare": "Cloudflare Workers AI (free daily allowance)",
+    "sambanova": "SambaNova Cloud (free tier)",
+    "chutes": "Chutes (pay as you go, no free tier)",
+    "pollinations": "Pollinations (daily free pollen grant)",
+    "ollama": "Ollama (local, no key)",
+    "lmstudio": "LM Studio (local, no key)",
 }
 
 
@@ -733,6 +875,27 @@ def _prompt_catalogue_model(provider: str, default_model: str, role: str = "") -
     return _pick_model(label, rows, default_model, role, paid_by)
 
 
+
+
+def provider_options() -> dict[str, dict]:
+    """Ordered provider catalogue for consumers that own their routing UI.
+
+    Config files only: consumers call this at import, so it never asks a provider what
+    it serves. choose_ai's model menu is where the live listing happens."""
+    options = {}
+    for provider in PROVIDER_CONFIG_MAP:
+        with open(provider_config_path(provider), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        options[provider] = {
+            "provider": provider,
+            "label": PROVIDER_LABELS.get(provider, provider),
+            "models": tuple(str(mid).lower() for mid in data.get("models") or ())
+                      if provider in CATALOGUE_PROVIDERS else (),
+            "writing_model": str(data.get("writing_model") or "").lower(),
+            "review_model": str(data.get("review_model") or data.get("writing_model") or "").lower(),
+            "needs_api_key": bool(data.get("api_key_env")),
+        }
+    return options
 
 
 def provider_config_path(provider: str) -> str:
@@ -787,7 +950,8 @@ def choose_ai(
             _artificial_analysis()
     if provider in ("openai", "openai-oauth"):
         with _loading("OpenAI models"):
-            model_info = _load_openai_oauth_models() if provider == "openai-oauth" else None
+            model_info = (_load_openai_oauth_models() if provider == "openai-oauth"
+                          else _load_openai_api_models())
         options = tuple(model_info) if model_info is not None else OPENAI_MODEL_OPTIONS
         base_key = "openai_oauth_model" if provider == "openai-oauth" else "openai_model"
         for i, role in enumerate(roles):
@@ -796,7 +960,8 @@ def choose_ai(
                 "gpt-6-sol" if provider == "openai-oauth" else None)
             default_model = _load_last_openai_model(fallback, options, key, state_file)
             models.append(default_model if mode == "auto"
-                          else _prompt_openai_model(default_model, model_info, label(role)))
+                          else _prompt_openai_model(default_model, model_info, label(role),
+                                                     provider == "openai-oauth"))
             state_keys.append(key)
         os.environ["AI_WRITING_MODEL"] = models[0]
         os.environ["AI_REVIEW_MODEL"] = models[-1]
@@ -844,4 +1009,3 @@ def choose_ai(
         dict(zip(state_keys[1:], models[1:])),
     )
     return provider, config_path, models
-

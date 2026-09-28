@@ -1,10 +1,12 @@
 {
   "provider": "openai",
   "use_openai_client": true,
-  "writing_model": "gpt-5.4-mini",
-  "review_model": "gpt-5.4-mini",
+  "writing_model": "gpt-6-luna",
+  "review_model": "gpt-6-luna",
   "openai_big_models": [
-    "gpt-5.4"
+    "gpt-6-sol",
+    "gpt-6-astra",
+    "gpt-5.6-sol"
   ],
   "base_url": "https://api.openai.com",
   "api_key_env": "OPENAI_API_KEY",

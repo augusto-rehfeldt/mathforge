@@ -1,0 +1,45 @@
+{
+  "provider": "openrouter",
+  "use_openai_client": true,
+  "token_param": "max_tokens",
+  "usage_state_path": "book_output/ai_usage_state.json",
+  "timeout": 900,
+  "writing_model": "deepseek/deepseek-v4.1-flash",
+  "review_model": "z-ai/glm-5.3-flash",
+  "base_url": "https://gen.pollinations.ai/v1",
+  "api_key_env": "POLLINATIONS_API_KEY",
+  "models": {
+    "deepseek/deepseek-v4.1-flash": {
+      "name": "DeepSeek V4.1 Flash (Pollinations)",
+      "max_output": 65536
+    },
+    "z-ai/glm-5.3-flash": {
+      "name": "GLM-5.3 Flash (Pollinations)",
+      "max_output": 65536
+    },
+    "openai/gpt-6-luna": {
+      "name": "GPT-6 Luna (Pollinations)",
+      "max_output": 65536
+    },
+    "minimax/minimax-m3": {
+      "name": "MiniMax M3 (Pollinations)",
+      "max_output": 65536
+    },
+    "z-ai/glm-5.3": {
+      "name": "GLM-5.3 (Pollinations)",
+      "max_output": 65536
+    },
+    "moonshotai/kimi-k3": {
+      "name": "Kimi K3 (Pollinations)",
+      "max_output": 65536
+    },
+    "openai/gpt-6-sol": {
+      "name": "GPT-6 Sol (Pollinations)",
+      "max_output": 65536
+    },
+    "openai/gpt-oss-20b": {
+      "name": "GPT-OSS 20B (Pollinations)",
+      "max_output": 32768
+    }
+  }
+}

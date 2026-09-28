@@ -1,0 +1,29 @@
+{
+  "provider": "openrouter",
+  "use_openai_client": true,
+  "token_param": "max_tokens",
+  "usage_state_path": "book_output/ai_usage_state.json",
+  "timeout": 900,
+  "writing_model": "mistral-medium-latest",
+  "review_model": "mistral-large-latest",
+  "base_url": "https://api.mistral.ai/v1",
+  "api_key_env": "MISTRAL_API_KEY",
+  "models": {
+    "mistral-large-latest": {
+      "name": "Mistral Large",
+      "max_output": 32768
+    },
+    "mistral-medium-latest": {
+      "name": "Mistral Medium",
+      "max_output": 32768
+    },
+    "magistral-medium-latest": {
+      "name": "Magistral Medium",
+      "max_output": 32768
+    },
+    "mistral-small-latest": {
+      "name": "Mistral Small",
+      "max_output": 32768
+    }
+  }
+}

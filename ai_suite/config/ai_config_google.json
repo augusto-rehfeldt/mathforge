@@ -1,8 +1,8 @@
 {
   "provider": "google",
   "use_openai_client": false,
-  "writing_model": "gemini-3.5-flash",
-  "review_model": "gemini-3.5-flash",
+  "writing_model": "gemini-3.8-flash",
+  "review_model": "gemini-3.8-flash",
   "api_key_env": "GOOGLE_API_KEY",
   "usage_state_path": "book_output/ai_usage_state.json",
   "openai_daily_token_limits": {

@@ -1,8 +1,8 @@
 {
   "provider": "groq",
   "use_openai_client": true,
-  "writing_model": "groq/compound",
-  "review_model": "groq/compound",
+  "writing_model": "openai/gpt-oss-120b",
+  "review_model": "openai/gpt-oss-120b",
   "base_url": "https://api.groq.com/openai/v1",
   "api_key_env": "GROQ_API_KEY",
   "usage_state_path": "book_output/ai_usage_state.json",

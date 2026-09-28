@@ -1,8 +1,8 @@
 {
   "provider": "minimax",
   "use_openai_client": false,
-  "writing_model": "MiniMax-M2.7",
-  "review_model": "MiniMax-M2.7",
+  "writing_model": "MiniMax-M3",
+  "review_model": "MiniMax-M3",
   "base_url": "https://api.minimax.io/anthropic",
   "api_key_env": "MINIMAX_API_KEY",
   "usage_state_path": "book_output/ai_usage_state.json",

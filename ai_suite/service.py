@@ -15,8 +15,9 @@ from contextlib import contextmanager
 from functools import wraps
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, Iterable, List, Tuple
+from typing import Callable, Optional, Dict, Any, Iterable, List, Tuple
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 try:
     import requests
@@ -52,6 +53,11 @@ DEFAULT_GROQ_RATE_STATE_PATH = os.path.join(
 OPENAI_OAUTH_PORT = 10531
 
 
+def background_process_options() -> dict:
+    """Suppress Windows console allocation for noninteractive helpers."""
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
 def _openai_oauth_proxy_running() -> bool:
     try:
         with socket.create_connection(("127.0.0.1", OPENAI_OAUTH_PORT), timeout=0.5):
@@ -60,17 +66,24 @@ def _openai_oauth_proxy_running() -> bool:
         return False
 
 
-def ensure_openai_oauth_proxy() -> None:
+def ensure_openai_oauth_proxy(*, log: Optional[Callable[[str], None]] = None) -> None:
     if _openai_oauth_proxy_running():
         return
     npx = shutil.which("npx.cmd") or shutil.which("npx")
     if not npx:
         raise RuntimeError("OpenAI OAuth requires Node.js with npx on PATH.")
-    print("Starting the OpenAI OAuth proxy; complete browser sign-in if prompted...")
+    (log or print)("Starting the OpenAI OAuth proxy; complete browser sign-in if prompted...")
     try:
-        subprocess.run([npx, "openai-oauth@latest", "--detach"], check=True)
+        options = {"capture_output": True, "text": True} if log is not None else {}
+        result = subprocess.run([npx, "openai-oauth@latest", "--detach"], check=True,
+                                **options, **background_process_options())
+        if log is not None:
+            for line in ((result.stdout or "") + "\n" + (result.stderr or "")).splitlines():
+                if line.strip():
+                    log(line)
     except subprocess.CalledProcessError as exc:
-        raise RuntimeError("OpenAI OAuth proxy failed to start.") from exc
+        detail = " ".join(str(part).strip() for part in (exc.stdout, exc.stderr) if part)
+        raise RuntimeError(f"OpenAI OAuth proxy failed to start. {detail}".strip()) from exc
     for _ in range(40):
         if _openai_oauth_proxy_running():
             return
@@ -201,7 +214,7 @@ def _run_cli(args: List[str], prompt: str, timeout: int, env: Optional[Dict[str,
     `abort` is watched on stderr as it arrives: a matching line kills the tree and
     raises RuntimeError with the line's first group, for a CLI that logs an error
     and then retries it silently instead of exiting."""
-    flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    flags = background_process_options()
     extra = dict(flags, env={**os.environ, **env}) if env else flags
     # No `with`: its exit waits for the pipes, which a surviving grandchild keeps open.
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -301,13 +314,17 @@ def commandcode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system
 
     It has no system-prompt flag, so the instruction leads the prompt instead.
     """
+    # --no-auto-update: an update otherwise prints "Updated 1.65.0 → 1.66.0" into the reply.
     args = [commandcode_executable(), "-p", "--output-format", "text", "--model", model,
-            "--skip-onboarding", "--no-skills", "--no-session"]
+            "--skip-onboarding", "--no-skills", "--no-session", "--no-auto-update"]
     proc = _run_cli(args, f"{_cli_system(system)}\n\n{prompt}", timeout)
     if proc.returncode:
         meaning = COMMANDCODE_EXIT_MEANINGS.get(proc.returncode, "")
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise RuntimeError(f"commandcode exited {proc.returncode}{f' ({meaning})' if meaning else ''}: {detail}")
+        failure = RuntimeError(f"commandcode exited {proc.returncode}{f' ({meaning})' if meaning else ''}: {detail}")
+        # Login, plan (403 MODEL_NOT_IN_PLAN) and credit refusals never change on retry.
+        failure.status_code = {3: 401, 4: 403, 10: 402}.get(proc.returncode)
+        raise failure
     out = (proc.stdout or "").strip()
     if not out:
         raise RuntimeError(
@@ -481,10 +498,11 @@ LIMIT_ERROR_RE = re.compile(
 LIMIT_WINDOW_RE = re.compile(r"hit your \w+ limit|usage limit|(?<!rate )limit reached", re.I)
 # Errors no retry can fix: the model id is wrong for this provider, or the account
 # has no funds/credits/subscription for it. Also Claude Code's reply to a bad
-# --model ("There's an issue with the selected model"), which arrives as text.
+# --model ("There's an issue with the selected model"), which arrives as text, and
+# Pollinations' out-of-pollen reply ("doesn't have enough credits"), a 200 with text.
 REFUSAL_RE = re.compile(
     r"model not found|issue with the selected model|insufficient (account )?(funds|balance|credits?)|"
-    r"doesn'?t have any credits|subscription is required", re.I
+    r"doesn'?t have (any|enough) credits|subscription is required", re.I
 )
 LIMIT_RETRY = 60  # seconds between retries of a limited call
 LIMIT_TRIES = 5  # limited calls in a row before the long pause
@@ -690,7 +708,27 @@ def save_ledger(path, payload):
 
 
 class AIService:
-    OPENAI_BIG_MODELS = {"gpt-5.4"}
+    OPENAI_BIG_MODELS = {"gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol"}
+
+    def chat_completion_response(self, payload: Dict[str, Any]):
+        """Open a raw Chat Completions response for an HTTP protocol gateway.
+
+        The caller owns the response context and translates JSON or SSE, including
+        tools and usage. No retries, text extraction, or token-cap rewriting occur.
+        This opt-in transport is restricted to unmetered `http` configurations;
+        it cannot bypass the managed OpenAI/Groq ledgers or invoke a CLI.
+        """
+        if self.provider != "http":
+            raise ValueError("Raw gateway responses require provider='http'")
+        if not isinstance(payload, dict) or not isinstance(payload.get("model"), str) or not payload["model"].strip():
+            raise ValueError("A nonempty model is required")
+        if not isinstance(payload.get("messages"), list) or not payload["messages"]:
+            raise ValueError("messages must be a nonempty list")
+        headers = {"Content-Type": "application/json", **self._extra_headers()}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        request = Request(self.base_url + "/chat/completions", data=json.dumps(payload).encode(), headers=headers)
+        return urlopen(request, timeout=self.timeout)
 
     def set_reasoning_effort(self, writing=None, review=None) -> bool:
         """Configure work/review requests without wrapping the underlying client."""
@@ -719,6 +757,7 @@ class AIService:
         allow_auth_prompt: bool = True,
         client_max_retries: Optional[int] = None,
         config_overrides: Optional[Dict[str, Any]] = None,
+        log: Optional[Callable[[str], None]] = None,
     ):
         """
         Initialize AIService.
@@ -732,6 +771,7 @@ class AIService:
             "timeout": 60
         }
         """
+        self._log_callback = log
         self.allow_auth_prompt = allow_auth_prompt
         self.client_max_retries = client_max_retries
         self.reasoning_effort = None
@@ -760,6 +800,11 @@ class AIService:
                               or os.getenv("AI_WRITING_MODEL", self.config.get("writing_model", "MiniMax-M2.7")))
         self.review_model = (self._overrides.get("review_model")
                              or os.getenv("AI_REVIEW_MODEL", self.config.get("review_model", "MiniMax-M2.7")))
+        # The model menu lowercases picks; SambaNova and Chutes ids are case-sensitive,
+        # so a pick the config's catalogue lists goes out spelled as the config spells it.
+        cased = {str(mid).lower(): str(mid) for mid in self.config.get("models") or {}}
+        self.writing_model = cased.get(str(self.writing_model).lower(), self.writing_model)
+        self.review_model = cased.get(str(self.review_model).lower(), self.review_model)
         self.openai_big_models = {
             str(model).strip().lower()
             for model in self.config.get("openai_big_models", list(self.OPENAI_BIG_MODELS))
@@ -798,21 +843,33 @@ class AIService:
             self.config.get("groq_rate_state_path", DEFAULT_GROQ_RATE_STATE_PATH),
         )
         self._budget_pause_reason = ""
+        if usage_state_path is None and "usage_state_path" in self._overrides:
+            self.usage_state_path = self._overrides["usage_state_path"]
+        if "groq_rate_state_path" in self._overrides:
+            self.groq_rate_state_path = self._overrides["groq_rate_state_path"]
         self._budget_pause_requested = False
         self._usage_state = self._load_usage_state()
         self._groq_rate_state = self._load_groq_rate_state()
 
         if not self.api_key and self.provider != "http":
-            print(
+            self._log(
                 "Warning: No API key provided. Set the provider-specific env var "
                 "(OPENAI_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY, OPENROUTER_API_KEY, or AI_API_KEY) "
                 "or update your local override file."
             )
 
         if self.provider == "openai-oauth":
-            ensure_openai_oauth_proxy()
+            ensure_openai_oauth_proxy(**({"log": log} if log is not None else {}))
         self._init_client()
-        print("AI Service initialized with provider:", self.provider_label)
+        self._log("AI Service initialized with provider:", self.provider_label)
+
+    def _log(self, *parts) -> None:
+        """Route diagnostics to the host UI without redirecting process-wide streams."""
+        callback = getattr(self, "_log_callback", None)
+        if callback is None:
+            print(*parts)
+        else:
+            callback(" ".join(str(part) for part in parts))
 
     def _load_config(self, path: str) -> Optional[Dict[str, Any]]:
         try:
@@ -820,7 +877,7 @@ class AIService:
                 data = json.load(f)
                 return data
         except Exception as e:
-            print(f"Failed to load config from '{path}': {e}")
+            self._log(f"Failed to load config from '{path}': {e}")
             return None
 
     def _resolve_api_key(self) -> str:
@@ -900,8 +957,8 @@ class AIService:
         if not self.allow_auth_prompt:
             return False
         api_key_env = self._api_key_env_name()
-        print(f"\n[!] {self.provider_label} API request returned 401 Unauthorized.")
-        print(f"    Your {api_key_env} is missing or invalid.")
+        self._log(f"\n[!] {self.provider_label} API request returned 401 Unauthorized.")
+        self._log(f"    Your {api_key_env} is missing or invalid.")
         new_key = input(f"    Enter your {api_key_env} (will be saved to .env): ").strip()
         if new_key:
             self._save_api_key_to_dotenv(api_key_env, new_key)
@@ -910,10 +967,10 @@ class AIService:
             self.client = None
             self.session = None
             self._init_client()
-            print(f"    ✓ {api_key_env} saved. Retrying...")
+            self._log(f"    ✓ {api_key_env} saved. Retrying...")
             return True
         else:
-            print("    Skipping — no key provided.")
+            self._log("    Skipping — no key provided.")
             return False
 
     def _save_api_key_to_dotenv(self, key: str, value: str) -> None:
@@ -963,7 +1020,25 @@ class AIService:
     def _load_usage_state(self):
         state = read_ledger(self.usage_state_path, self._default_usage_state())
         self._reset_usage_state_if_needed(state)
+        # The config is the source of truth: a raised or removed cap unpauses today's ledger.
+        for name, bucket_state in state.get("buckets", {}).items():
+            bucket_state["limit"] = self._bucket_limit(name)
+        if state.get("paused") and not any(
+            self._bucket_over_budget(name, int(b.get("tokens", 0)))
+            for name, b in state.get("buckets", {}).items()
+        ):
+            state["paused"] = False
+            state["pause_reason"] = ""
         return state
+
+    def _bucket_limit(self, bucket: str) -> Optional[int]:
+        """Daily token cap for an OpenAI bucket; None (null in the config) means uncapped."""
+        limit = self.openai_daily_token_limits.get(bucket, 0)
+        return None if limit is None else int(limit)
+
+    def _bucket_over_budget(self, bucket: str, tokens: int) -> bool:
+        limit = self._bucket_limit(bucket)
+        return limit is not None and tokens > int(limit * 0.95)  # stop within 5% of max
 
 
     def _default_usage_state(self) -> Dict[str, Any]:
@@ -972,16 +1047,9 @@ class AIService:
             "paused": False,
             "pause_reason": "",
             "buckets": {
-                "pro": {
-                    "tokens": 0,
-                    "limit": int(self.openai_daily_token_limits.get("pro", 250000)),
-                    "models": {},
-                },
-                "mini": {
-                    "tokens": 0,
-                    "limit": int(self.openai_daily_token_limits.get("mini", 2500000)),
-                    "models": {},
-                },
+                # "limit" is filled in from the config by _load_usage_state.
+                "pro": {"tokens": 0, "models": {}},
+                "mini": {"tokens": 0, "models": {}},
             },
         }
 
@@ -1042,7 +1110,8 @@ class AIService:
         normalized = model_name.lower()
         if normalized in self.openai_big_models:
             return "pro"
-        return "mini" if "mini" in normalized else "pro"
+        # Small tiers share the larger daily allowance.
+        return "mini" if any(w in normalized for w in ("mini", "nano", "luna")) else "pro"
 
     def _estimate_tokens(self, text: str) -> int:
         return max(1, math.ceil(len(text) / 4))
@@ -1140,7 +1209,7 @@ class AIService:
 
     def _groq_wait_for_next_minute(self, reason: str) -> None:
         wait_seconds = self._groq_seconds_until_next_minute()
-        print(f"[groq] {reason} Waiting {wait_seconds} seconds for the rate window to reset...")
+        self._log(f"[groq] {reason} Waiting {wait_seconds} seconds for the rate window to reset...")
         time.sleep(wait_seconds)
         self._reset_groq_rate_state_if_needed(self._groq_rate_state)
 
@@ -1245,21 +1314,15 @@ class AIService:
         self._reset_usage_state_if_needed(self._usage_state)
         bucket = self._bucket_for_model(model_name)
         bucket_state = self._usage_state["buckets"].setdefault(
-            bucket,
-            {
-                "tokens": 0,
-                "limit": int(self.openai_daily_token_limits.get(bucket, 0)),
-                "models": {},
-            },
+            bucket, {"tokens": 0, "models": {}}
         )
-        bucket_state["limit"] = int(self.openai_daily_token_limits.get(bucket, bucket_state.get("limit", 0)))
+        bucket_state["limit"] = self._bucket_limit(bucket)
         bucket_state["tokens"] = int(bucket_state.get("tokens", 0)) + int(usage["total_tokens"])
         bucket_models = bucket_state.setdefault("models", {})
         bucket_models[model_name] = int(bucket_models.get(model_name, 0)) + int(usage["total_tokens"])
 
-        effective_limit = int(bucket_state["limit"] * 0.95) # Stop when within 5% of max
-        exceeded = bucket_state["tokens"] > effective_limit
-        
+        exceeded = self._bucket_over_budget(bucket, bucket_state["tokens"])
+
         self._usage_state["paused"] = exceeded
         self._usage_state["pause_reason"] = (
             f"{bucket} budget exceeded safety threshold for {model_name}"
@@ -1278,7 +1341,7 @@ class AIService:
         return {
             "bucket": bucket,
             "used": int(bucket_state["tokens"]),
-            "limit": int(bucket_state["limit"]),
+            "limit": bucket_state["limit"],
             "exceeded": exceeded,
         }
 
@@ -1419,15 +1482,15 @@ class AIService:
         self.session = None
 
         if self.provider == "claude":
-            print(f"Using the Claude Code CLI ({claude_executable()}) on your subscription")
+            self._log(f"Using the Claude Code CLI ({claude_executable()}) on your subscription")
             return
 
         if self.provider == "commandcode":
-            print(f"Using the Command Code CLI ({commandcode_executable()}) on your subscription")
+            self._log(f"Using the Command Code CLI ({commandcode_executable()}) on your subscription")
             return
 
         if self.provider == "opencode":
-            print(f"Using the OpenCode CLI ({opencode_executable()})")
+            self._log(f"Using the OpenCode CLI ({opencode_executable()})")
             return
 
         keyless = not self.api_key and self.provider != "openai-oauth"
@@ -1442,20 +1505,20 @@ class AIService:
                     kwargs["default_headers"] = headers
                 self.client = OpenAI(**kwargs)
                 if self.provider == "groq":
-                    print("Using OpenAI-compatible client for Groq")
+                    self._log("Using OpenAI-compatible client for Groq")
                 else:
-                    print(f"Using OpenAI Python client for {self.provider_label} at {self.base_url}")
+                    self._log(f"Using OpenAI Python client for {self.provider_label} at {self.base_url}")
                 return
             except Exception as e:
-                print(f"{self.provider.title()} client initialization failed, falling back to HTTP. Error:", e)
+                self._log(f"{self.provider.title()} client initialization failed, falling back to HTTP. Error:", e)
 
         if self.provider == "google" and _HAS_GEMINI_CLIENT:
             try:
                 self.client = genai.Client(api_key=self.api_key)
-                print("Using Google Gemini client")
+                self._log("Using Google Gemini client")
                 return
             except Exception as e:
-                print("Gemini client initialization failed. Error:", e)
+                self._log("Gemini client initialization failed. Error:", e)
 
         # Fallback: HTTP session for OpenAI-style APIs
         self.session = requests.Session() if requests is not None else _StdlibSession()
@@ -1463,7 +1526,7 @@ class AIService:
         if self.api_key:  # a keyless local endpoint (Ollama, LM Studio) gets no Authorization at all
             self.session.headers["Authorization"] = f"Bearer {self.api_key}"
         self.session.headers.update(self._extra_headers())
-        print("Using HTTP session for requests to:", self.base_url)
+        self._log("Using HTTP session for requests to:", self.base_url)
 
     def _extra_headers(self) -> Dict[str, str]:
         """Config headers, plus the session id opencode.ai now requires: without
@@ -1724,7 +1787,7 @@ class AIService:
             window = LIMIT_WINDOW_RE.search(notice) and limited % LIMIT_TRIES == 0
             wait = limit_reset_wait(notice) or (LIMIT_PAUSE if window else LIMIT_RETRY)
             resume = datetime.fromtimestamp(time.time() + wait).strftime("%H:%M")
-            print(f"[{self.provider_label}] usage limit ({' '.join(notice.split())[:120]}); "
+            self._log(f"[{self.provider_label}] usage limit ({' '.join(notice.split())[:120]}); "
                   f"try {limited}, waiting until {resume}")
             time.sleep(wait)
 
@@ -1816,13 +1879,12 @@ class AIService:
                     self._reset_usage_state_if_needed(self._usage_state)
                     bucket = self._bucket_for_model(model_to_use)
                     bucket_state = self._usage_state["buckets"].get(bucket, {})
-                    effective_limit = int(int(bucket_state.get("limit", 0)) * 0.95)
-                    if int(bucket_state.get("tokens", 0)) > effective_limit:
+                    if self._bucket_over_budget(bucket, int(bucket_state.get("tokens", 0))):
                         self._budget_pause_requested = True
                         raise DailyTokenBudgetExceeded(
                             bucket=bucket,
                             tokens_used=int(bucket_state.get("tokens", 0)),
-                            token_limit=int(bucket_state.get("limit", 0)),
+                            token_limit=self._bucket_limit(bucket),
                             model_name=model_to_use,
                             usage_state_path=self.usage_state_path,
                         )
@@ -1831,13 +1893,13 @@ class AIService:
                     text = claude_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system)
                     if text.strip():
                         return text
-                    print(f"[claude] returned empty content on attempt {attempt + 1}")
+                    self._log(f"[claude] returned empty content on attempt {attempt + 1}")
 
                 elif self.provider == "commandcode":
                     text = commandcode_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system)
                     if text.strip():
                         return text
-                    print(f"[commandcode] returned empty content on attempt {attempt + 1}")
+                    self._log(f"[commandcode] returned empty content on attempt {attempt + 1}")
 
                 elif self.provider == "opencode":
                     return opencode_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system,
@@ -1851,12 +1913,12 @@ class AIService:
                         )
                     except Exception as e:
                         last_error = e
-                        print(f"[gemini] client call failed on attempt {attempt + 1}: {e}")
+                        self._log(f"[gemini] client call failed on attempt {attempt + 1}: {e}")
                         raise
                     text = self._extract_text_from_response(resp)
                     if text and text.strip():
                         return text
-                    print(f"[gemini] returned empty content on attempt {attempt + 1}")
+                    self._log(f"[gemini] returned empty content on attempt {attempt + 1}")
 
                 elif self.client is not None and self.provider == "minimax":
                     # OpenAI Python client (MiniMax OpenAI-compatible API)
@@ -1880,12 +1942,12 @@ class AIService:
                             if retry_ok:
                                 continue
                         last_error = e
-                        print(f"[{self.provider_label}_client] client call failed on attempt {attempt + 1}: {e}")
+                        self._log(f"[{self.provider_label}_client] client call failed on attempt {attempt + 1}: {e}")
                         raise
                     text = self._extract_text_from_response(resp)
                     if text and text.strip():
                         return text
-                    print(f"[{self.provider_label}_client] returned empty content on attempt {attempt + 1}")
+                    self._log(f"[{self.provider_label}_client] returned empty content on attempt {attempt + 1}")
 
                 elif self.client is not None and self.provider == "openai":
                     # OpenAI Python client
@@ -1902,7 +1964,7 @@ class AIService:
                         resp = self.client.responses.create(**client_kwargs)
                     except Exception as e:
                         last_error = e
-                        print(f"[{self.provider_label}_client] client call failed on attempt {attempt + 1}: {e}")
+                        self._log(f"[{self.provider_label}_client] client call failed on attempt {attempt + 1}: {e}")
                         raise
                     text = self._extract_text_from_response(resp)
                     if text and text.strip():
@@ -1910,13 +1972,13 @@ class AIService:
                         if self.provider == "openai":
                             budget_info = self._record_openai_usage(model_to_use, usage)
                             if budget_info["exceeded"]:
-                                print(
+                                self._log(
                                     f"⚠️ OpenAI {budget_info['bucket']} usage is now "
                                     f"{budget_info['used']:,}/{budget_info['limit']:,} tokens today. "
                                     "Progress has been cached and the next OpenAI request will pause."
                                 )
                         return text
-                    print(f"[{self.provider_label}_client] returned empty content on attempt {attempt + 1}")
+                    self._log(f"[{self.provider_label}_client] returned empty content on attempt {attempt + 1}")
 
                 elif self.client is not None and self.provider == "groq":
                     try:
@@ -1928,21 +1990,21 @@ class AIService:
                         )
                     except Exception as e:
                         last_error = e
-                        print(f"[groq_client] client call failed on attempt {attempt + 1}: {e}")
+                        self._log(f"[groq_client] client call failed on attempt {attempt + 1}: {e}")
                         raise
                     text = self._extract_text_from_response(resp)
                     if text and text.strip():
                         usage = self._extract_usage_from_response(resp, prompt, text)
                         rate_info = self._record_groq_usage(model_to_use, usage)
                         if rate_info["exceeded"]:
-                            print(
+                            self._log(
                                 f"⚠️ Groq rate usage is now minute tokens {rate_info['minute_tokens']:,}/{rate_info['tpm_limit']:,}, "
                                 f"minute requests {rate_info['minute_requests']:,}/{rate_info['rpm_limit']:,}, "
                                 f"day requests {rate_info['day_requests']:,}/{rate_info['rpd_limit']:,}. "
                                 "Progress has been cached and the next Groq request will pause."
                             )
                         return text
-                    print(f"[groq_client] returned empty content on attempt {attempt + 1}")
+                    self._log(f"[groq_client] returned empty content on attempt {attempt + 1}")
 
                 elif self.client is not None and self.provider in ("openai-oauth", "openrouter", "hyper", "grok"):
                     try:
@@ -1966,7 +2028,7 @@ class AIService:
                             resp = self._join_stream(resp)
                     except Exception as e:
                         last_error = e
-                        print(f"[{self.provider_label}_client] client call failed on attempt {attempt + 1}: {e}")
+                        self._log(f"[{self.provider_label}_client] client call failed on attempt {attempt + 1}: {e}")
                         raise
                     text = self._extract_text_from_response(resp)
                     if text and text.strip():
@@ -1981,7 +2043,7 @@ class AIService:
                         finish_reason = resp.choices[0].finish_reason
                     except Exception:
                         pass
-                    print(f"[{self.provider_label}_client] returned empty content on attempt {attempt + 1} (finish_reason={finish_reason})")
+                    self._log(f"[{self.provider_label}_client] returned empty content on attempt {attempt + 1} (finish_reason={finish_reason})")
 
                 else:
                     # HTTP endpoint (OpenAI-compatible)
@@ -2018,14 +2080,14 @@ class AIService:
                         r = self.session.post(url, json=payload, timeout=self.timeout)
                     except _TRANSPORT_ERRORS as e:
                         last_error = e
-                        print(f"[http] request failed on attempt {attempt + 1}: {e}")
+                        self._log(f"[http] request failed on attempt {attempt + 1}: {e}")
                         raise
 
                     if r.status_code == 200:
                         try:
                             data = r.json()
                         except ValueError:
-                            print(f"[http] response not JSON on attempt {attempt + 1}")
+                            self._log(f"[http] response not JSON on attempt {attempt + 1}")
                             data = {}
                         text = self._extract_text_from_response(data)
                         if text and text.strip():
@@ -2033,7 +2095,7 @@ class AIService:
                             if self.provider == "openai":
                                 budget_info = self._record_openai_usage(model_to_use, usage)
                                 if budget_info["exceeded"]:
-                                    print(
+                                    self._log(
                                         f"⚠️ OpenAI {budget_info['bucket']} usage is now "
                                         f"{budget_info['used']:,}/{budget_info['limit']:,} tokens today. "
                                         "Progress has been cached and the next OpenAI request will pause."
@@ -2041,14 +2103,14 @@ class AIService:
                             elif self.provider == "groq":
                                 rate_info = self._record_groq_usage(model_to_use, usage)
                                 if rate_info["exceeded"]:
-                                    print(
+                                    self._log(
                                         f"⚠️ Groq rate usage is now minute tokens {rate_info['minute_tokens']:,}/{rate_info['tpm_limit']:,}, "
                                         f"minute requests {rate_info['minute_requests']:,}/{rate_info['rpm_limit']:,}, "
                                         f"day requests {rate_info['day_requests']:,}/{rate_info['rpd_limit']:,}. "
                                         "Progress has been cached and the next Groq request will pause."
                                     )
                             return text
-                        print(f"[http] returned empty content on attempt {attempt + 1}")
+                        self._log(f"[http] returned empty content on attempt {attempt + 1}")
                     else:
                         if r.status_code in (429, 502, 503, 504):
                             if self.provider == "groq":
@@ -2071,14 +2133,14 @@ class AIService:
                                     )
                             # Kept as the last error so a caller whose retries run out sees the status.
                             last_error = TransportError(f"HTTP {r.status_code}: {r.text[:300]}", r.status_code)
-                            print(f"[http] transient HTTP error {r.status_code} - will retry (attempt {attempt + 1})")
+                            self._log(f"[http] transient HTTP error {r.status_code} - will retry (attempt {attempt + 1})")
                         elif r.status_code == 401:
                             # 401 means auth failure — prompt for API key and save to .env
                             if self._handle_401_auth_error():
                                 continue
                             r.raise_for_status()
                         else:
-                            print(f"[http] HTTP error {r.status_code}: {r.text}")
+                            self._log(f"[http] HTTP error {r.status_code}: {r.text}")
                             r.raise_for_status()
 
             except (DailyTokenBudgetExceeded, UsageLimitExceeded, UsageStateError):
@@ -2088,7 +2150,7 @@ class AIService:
                 # attempt may finish; a larger budget helps when the cap cut it.
                 last_error = e
                 completion_tokens = min(completion_tokens * 2, ceiling) if ceiling else completion_tokens * 2
-                print(f"[{self.provider_label}] Incomplete output on attempt {attempt + 1}; "
+                self._log(f"[{self.provider_label}] Incomplete output on attempt {attempt + 1}; "
                       f"retrying with {completion_tokens} completion tokens")
             except Exception as e:
                 error_text = str(e).lower()
@@ -2117,7 +2179,7 @@ class AIService:
                             )
                         retry_after = groq_rate_limit.get("retry_after")
                         if retry_after and attempt < max_retries - 1:
-                            print(
+                            self._log(
                                 f"[groq] Rate limit reached on attempt {attempt + 1}; "
                                 f"waiting {retry_after} seconds before retrying."
                             )
@@ -2129,22 +2191,22 @@ class AIService:
                     # A refusal, not an outage (opencode-zen's free models now only
                     # answer OpenCode's own client; an unknown model id; no funds):
                     # retrying cannot change the answer.
-                    print(f"[{self.provider_label}] {model_to_use} refused the request "
+                    self._log(f"[{self.provider_label}] {model_to_use} refused the request "
                           f"({f'HTTP {status}' if status else e}); choose another provider or model")
                     raise
                 last_error = e
-                print(f"[{self.provider_label}] Error on attempt {attempt + 1}: {e}")
+                self._log(f"[{self.provider_label}] Error on attempt {attempt + 1}: {e}")
 
             if attempt + 1 >= max_retries:
                 break  # no attempt left to wait for
             delay = retry_delays[min(attempt, len(retry_delays)-1)]
-            print(f"Waiting {delay} seconds before retry...")
+            self._log(f"Waiting {delay} seconds before retry...")
             time.sleep(delay)
             attempt += 1
 
-        print("CRITICAL ERROR: Failed to generate content after all retries")
+        self._log("CRITICAL ERROR: Failed to generate content after all retries")
         if last_error:
-            print("Last error:", last_error)
+            self._log("Last error:", last_error)
             raise last_error
         raise EmptyGenerationError(f"{self.provider_label} {model_to_use} returned no text after {max_retries} attempt(s)")
 
