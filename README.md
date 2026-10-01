@@ -16,7 +16,7 @@ program, a compiler, or a model reading evidence it did not produce.
 | Falsify | work model, writes a search script | the claim, not the proposer's reasoning — it is rewarded for breaking it |
 | Confirm | review model, writes a second script | a reported witness; re-checks the hypotheses and both sides from the statement alone |
 | Lean refutation | work model, `lake env lean` | a confirmed witness; proves `¬ (claim)` sorry-free, then back-translated like the proof |
-| Novelty | review model + arXiv, Crossref, OpenAlex | the statement, plus retrieved abstracts |
+| Novelty | review model + arXiv, Crossref, OpenAlex, AiraXiv | the statement, plus retrieved abstracts |
 | Prove | work model | the claim and the search evidence |
 | Referee | review model | the proof, told to find the error |
 | Independent check | review model, writes a second script | the proof; re-implements every definition from scratch |
@@ -104,6 +104,53 @@ Published URLs are recorded in `state.json` and in `math_output/index.md`; a
 resumed run reuses the URL instead of publishing twice, and a failed publish is
 retried on the next resume. Requires the GitHub CLI logged in (`gh auth login`).
 A published folder is public the moment it is pushed, before anyone has read it.
+
+### Submission packages
+
+Every run that writes a paper also refreshes `math_output/_submissions/`, no flag
+needed; `python mathforge.py --export-latex` refreshes the folder and exits (exit
+status 1 if any package is not `ok`). It holds, for the paper of every run whose
+kept results are all `verified` or `machine-verified`, `<run>.md`, `<run>.tex` and
+`<run>.pdf`, plus `_refutations.*` (one note collecting every `machine-refuted`
+result, each as a proposition proved by its witness) and a `README.md` listing
+title, abstract, and each result with its status and models. A paper that also
+keeps a `provisional` result is listed there as not packaged, because the paper
+typesets that claim as a theorem.
+
+The conversion is heuristic. Theorem, lemma and proof headings or paragraph leads
+become LaTeX `theorem` / `lemma` / `proof` environments, the structure
+[ProofForum](https://www.proofforum.org) extracts; the papers are model-written
+Markdown, so a statement the paper restates appears twice and prose after an
+unmarked proof can land inside it. Read a PDF before submitting it. The PDF alone
+is what [AiraXiv](https://airaxiv.com/) takes. A paper is compiled again only when
+its LaTeX changes; `status.json` keeps each build's result, including warnings
+about missing glyphs and lines past the margin (overflow inside a code block is
+not detected). A failed build is retried by `--export-latex`, not by later runs.
+
+Needs `pandoc`; the PDF needs `tectonic` or `xelatex` (without one, only `.md` and
+`.tex` are written). Tectonic downloads its TeX files on first use.
+`MATHFORGE_AUTHOR` overrides the author, which defaults to `git config user.name`.
+
+Building the folder uploads nothing, and a `verified` result is a referee model's
+verdict plus a script, not a Lean proof. ProofForum wants a verified academic
+affiliation and a recorded full-paper AI check, so it stays manual.
+
+`--submit-airaxiv [N]` uploads up to N (default 3) packages not yet sent to
+AiraXiv's AI-generated track, the refutations note first; they become public once
+the site's moderation passes them. Alone it uploads and exits; with a seed,
+`--resume` or `--forever` it uploads after every run. It needs `AIRAXIV_API_KEY`
+(airaxiv.com, My API Keys) in the environment or in this folder's `.env`, and records each
+submission in `_submissions/airaxiv.json`. A package is sent when its build status
+is `ok` (a margin warning is allowed, missing glyphs are not) and it is not in that
+record. N is capped at 10 per call, and the site's own rate limit ends a batch
+earlier; the rest go on the next call. If a reply is lost after a paper was sent,
+its entry stays marked `submitting` and is never sent again automatically: check
+My Papers on the site and fix or delete the entry. An unreadable `airaxiv.json`
+stops the upload instead of counting as "nothing sent". The folder is refreshed
+before every upload, and nothing is sent if that refresh could not run (no
+pandoc). A paper the site refuses is recorded as `refused` and not offered again
+until its PDF changes. The site's terms forbid
+large-scale automated submission: keep N small, and read what you send.
 
 ### Lean
 

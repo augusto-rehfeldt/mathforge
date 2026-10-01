@@ -233,6 +233,72 @@ first; a failure means no bundle, and the README says why. `formalization.yaml`
 (review model, cached as `cN.classify`) supplies the arXiv/MSC codes, falling back
 to math.CO / 05A99. `lake comparator` itself has not been run locally.
 
+### Submission packages
+
+`export_latex` (run by `research_run` after every run with a paper or a
+`machine-refuted` result, and by `--export-latex`) fills `math_output/_submissions/`:
+one `.md`/`.tex`/`.pdf` per run paper whose keepers are all `verified` or
+`machine-verified` (a paper with a `provisional` keeper is listed under "Not packaged":
+it typesets that claim as a theorem), `_refutations.*` from `refutations_note` (all
+`machine-refuted` results, each a `**Proposition k.**` / `**Proof.**` pair), a
+`README.md` index with every result's status, and `status.json`. It uploads nothing
+and is separate from `--publish`, whose Lean-only rule (`PUBLISH_STATUSES`) is unchanged.
+
+`pandoc_input` builds what pandoc reads. `paper_meta` lifts title and abstract into the
+metadata block and raises the paper's numbered sections to top level (an embedded proof
+brings its own headings at any depth). `theorem_envs` turns theorem/lemma/proof headings,
+bold leads and unmarked `Lemma 1.` / `Proof.` leads into LaTeX environments, emitted as
+raw `{=latex}` blocks so the text between stays Markdown. Its rules, each from a live
+paper: a statement ends at the next heading, lead, or proof announcement
+(`_STATEMENT_END`); a proof ends at its QED mark (`_QED`) or the next heading or lead; a
+theorem's proof cut short by a lemma is written as plain `*Proof.*` text with no QED box;
+a heading that carries the whole statement (nothing under it, or only a list) becomes the
+body; an empty lead-in proof is dropped; after a numbered verification, limitations or
+novelty section (`_AFTER_RESULTS`) no environment opens, because `Theorem 1` there heads
+a search log or a query list. `_stars` escapes `*` used as multiplication and `_plain` also handles a spaced
+backslash and `[n](x)` in plain-text statements, both through `_outside_math` so math and
+code are untouched. `latex_document` calls pandoc with `tex_math_single_backslash` on and
+`superscript`/`subscript` off (papers write `\(..\)`, statements write `x^{k}`), then
+splices `_LATEX_PREAMBLE` (amsthm environments, `newunicodechar` for `_UNICODE_TEX`).
+
+`build_pdf` runs tectonic or xelatex and reports missing glyphs (add the character to
+`_UNICODE_TEX`) and lines more than 20pt past the margin. `status.json` maps each package
+to its last build status: a paper is compiled again only when its `.tex` changes, so a
+failing one is not retried every run (`--export-latex` passes `retry=True` and does retry
+it), and the package of a run that stops qualifying is deleted; a run whose `state.json`
+is unreadable keeps its package. The selftest stubs `latex_document` and `build_pdf`, so it needs neither tool,
+and `_byline` falls back when git is missing. Two mathforge processes exporting at once
+are not coordinated.
+
+`submit_airaxiv` (`--submit-airaxiv [N]`, never implied by anything else) uploads `ok`
+packages to airaxiv.com through its MCP endpoint, spoken as plain JSON-RPC over
+`_airaxiv_http` (the one network call; the selftest replaces it): `initialize`, then per
+paper `create_upload` → `PUT` the PDF → `complete_upload` → `submit_paper`. Guards against
+sending twice, each from a review finding: `airaxiv.lock` allows one upload at a time;
+`airaxiv.json` is written through a temp file, and an unreadable one aborts the call
+(only a missing file means nothing was sent); an entry `{"state": "submitting"}` is
+written before `submit_paper` and replaced by the reply, so a lost or unreadable reply
+(`ValueError`, a timeout) leaves a marker that is reported and never retried, while a
+refusal (`RuntimeError`, an HTTP error) removes it and is tried again next time. N is
+clamped to 0..`AIRAXIV_MAX`, and a rate-limit reply ends the batch. The API key goes
+only to AiraXiv's own host over https (parsed hostname, not a string prefix), never to
+a signed upload URL elsewhere, and `_NoRedirect` refuses redirects. Packages whose
+status mentions missing glyphs are held back. Every caller goes through
+`export_and_submit`, which refreshes the folder first and sends nothing when
+`export_latex` returns `EXPORT_ABORTED` (pandoc missing), so the upload never reads a
+stale `status.json`. A `submit_paper` refusal other than the rate limit is recorded as
+`{"state": "refused", "sha256": ...}` and the paper is offered again only when its PDF's
+hash differs; otherwise a refused paper at the head of the queue would be retried, and
+would block the others, on every call. The request shape matches the endpoint's own `tools/list` schema and was run live on
+2026-10-01 (submission 1104). `AIRAXIV_API_KEY` is read from this project's `.env`
+(`load_local_env(HERE / ".env")`); a bare `load_local_env()` reads the ai-suite
+checkout's `.env` instead.
+
+The novelty search also asks AiraXiv (`search_airaxiv`, no key): its public search page
+is scraped for result cards, so a result this pipeline already uploaded there is seen as
+known. The site matches the query as one phrase; a query with no hit is asked again by
+its longest word.
+
 ## Security
 
 Every agent-written script is executed with `subprocess`, with `cwd` set to the
