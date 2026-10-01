@@ -57,8 +57,10 @@ python mathforge.py --selftest                 # offline, no API calls
 Other flags: `--verbose` logs every search query, code attempt and stage start;
 `--no-search` skips the arXiv/Crossref/OpenAlex novelty search; `--no-lean` runs
 without Lean (nothing becomes machine-checked or publishable); `--config <json>`
-uses an ai-suite config directly and skips the provider menu. `--effort`,
-`--review-effort` and `--max-tokens` tune each call (`--help` has the details).
+uses an ai-suite config directly and skips the provider menu. After each model the
+menu asks that model's reasoning effort, from the levels it lists; `--effort` and
+`--review-effort` override the picks, and `--max-tokens` tunes each call (`--help`
+has the details).
 
 Each run writes `math_output/<slug>/`: `state.json` (every stage, resumable),
 the generated scripts, `paper.md`, and `negative_results.md`. Runs are appended

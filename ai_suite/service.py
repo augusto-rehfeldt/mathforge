@@ -141,6 +141,9 @@ def load_opencode_go_sync() -> Dict[str, Any]:
 # Claude Code takes short aliases as well as full ids, so a config may name
 # either. Anything not listed is passed through untouched.
 CLAUDE_ALIAS = {"pro": "opus", "flash": "sonnet", "fast": "haiku"}
+# Config providers whose requests can carry a reasoning effort (the CLIs as a flag).
+EFFORT_PROVIDERS = ("openai", "openai-oauth", "openrouter", "hyper", "grok", "http",
+                    "claude", "commandcode", "opencode")
 
 
 # GUI hosts (Calibre, a game launched from Explorer) inherit the PATH frozen when
@@ -270,11 +273,14 @@ def _run_cli(args: List[str], prompt: str, timeout: int, env: Optional[Dict[str,
     return subprocess.CompletedProcess(args, proc.returncode, "".join(lines["out"]), "".join(lines["err"]))
 
 
-def claude_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: Optional[str] = None) -> str:
+def claude_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: Optional[str] = None,
+                effort: Optional[str] = None) -> str:
     """One completion from the Claude Code CLI in print mode, on the user's subscription."""
     args = [claude_executable(), "-p", "--output-format", "text", "--safe-mode", "--tools", "",
             "--system-prompt", _cli_system(system),
             "--model", CLAUDE_ALIAS.get(model.lower(), model)]
+    if effort:
+        args += ["--effort", effort]
     proc = _run_cli(args, prompt, timeout)
     out = (proc.stdout or "").strip()
     if not out:
@@ -309,7 +315,8 @@ def commandcode_executable() -> str:
     return exe
 
 
-def commandcode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: Optional[str] = None) -> str:
+def commandcode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: Optional[str] = None,
+                     effort: Optional[str] = None) -> str:
     """One completion from the Command Code CLI in headless mode.
 
     It has no system-prompt flag, so the instruction leads the prompt instead.
@@ -317,6 +324,8 @@ def commandcode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system
     # --no-auto-update: an update otherwise prints "Updated 1.65.0 → 1.66.0" into the reply.
     args = [commandcode_executable(), "-p", "--output-format", "text", "--model", model,
             "--skip-onboarding", "--no-skills", "--no-session", "--no-auto-update"]
+    if effort:
+        args += ["--effort", effort]
     proc = _run_cli(args, f"{_cli_system(system)}\n\n{prompt}", timeout)
     if proc.returncode:
         meaning = COMMANDCODE_EXIT_MEANINGS.get(proc.returncode, "")
@@ -347,7 +356,7 @@ OPENCODE_STREAM_ERROR_RE = re.compile(r'message="stream error".*\bsmall=false\b.
 
 
 def opencode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: Optional[str] = None,
-                  max_output: int = 0) -> str:
+                  max_output: int = 0, effort: Optional[str] = None) -> str:
     """One completion through the OpenCode CLI, the only client opencode.ai's free tier
     answers (direct API calls get 403 FreeTierError).
 
@@ -364,6 +373,8 @@ def opencode_chat(model: str, prompt: str, timeout: int = CLI_TIMEOUT, system: O
     """
     args = [opencode_executable(), "run", "--agent", "build", "--format", "json",
             "-m", model if "/" in model else f"opencode/{model}"]
+    if effort:
+        args += ["--variant", effort]  # OpenCode's name for a model's reasoning effort
     # A bare config home: the user's global AGENTS.md and plugins (and, through the
     # Claude Code compat, ~/.claude/CLAUDE.md) otherwise ride into every reply; a
     # caveman AGENTS.md got "draft blocked." instead of an essay. Login stays in the
@@ -734,20 +745,34 @@ class AIService:
         """Configure work/review requests without wrapping the underlying client."""
         self.reasoning_effort = writing
         self.review_reasoning_effort = writing if review is None else review
-        return self.provider in ('openai', 'openai-oauth', 'openrouter', 'hyper', 'grok', 'http')
+        return self.provider in EFFORT_PROVIDERS
 
-    def _reasoning_options(self, role, responses=False):
-        effort = self.reasoning_effort if role == 'writing' else self.review_reasoning_effort
-        if not effort or effort == 'provider-default':
+    def _effort(self, role, model=None):
+        """The effort a role's request carries, or None. Each effort was picked for its
+        role's model: a `model` override takes the effort of the role that names it, and
+        on any other model (a judge) keeps that model's default."""
+        writing = role == 'writing'
+        if model:
+            named = [str(m).lower() == str(model).lower() for m in (self.writing_model, self.review_model)]
+            if not any(named):
+                return None
+            writing = named[0] if named[0] != named[1] else writing
+        effort = self.reasoning_effort if writing else self.review_reasoning_effort
+        if not effort or effort == 'provider-default' or self.provider not in EFFORT_PROVIDERS:
+            return None
+        return effort
+
+    def _reasoning_options(self, role, responses=False, model=None):
+        effort = self._effort(role, model)
+        if not effort:
             return {}
-        if self.provider not in ('openai', 'openai-oauth', 'openrouter', 'hyper', 'grok', 'http'):
-            return {}
-        field = {'reasoning': {'effort': effort}}
         if responses:
-            return field
-        if self.provider == 'openai':
-            field = {'reasoning_effort': effort}
-        return {'extra_body': field}
+            return {'reasoning': {'effort': effort}}
+        # Chat completions: only OpenRouter itself reads the nested object. Every other
+        # endpoint (OpenAI, the ChatGPT sign-in proxy, xAI, OpenCode Go, the free tiers on
+        # the openrouter branch) reads `reasoning_effort` and ignores or rejects the object.
+        nested = self.provider == 'openrouter' and urlparse(self.base_url or '').hostname == 'openrouter.ai'
+        return {'extra_body': {'reasoning': {'effort': effort}} if nested else {'reasoning_effort': effort}}
 
     def __init__(
         self,
@@ -774,9 +799,10 @@ class AIService:
         self._log_callback = log
         self.allow_auth_prompt = allow_auth_prompt
         self.client_max_retries = client_max_retries
-        self.reasoning_effort = None
+        # choose_ai's effort menu exports these; set_reasoning_effort() overrides them.
+        self.reasoning_effort = os.getenv("AI_WRITING_EFFORT") or None
         self.last_usage = None  # provider-reported token counts of the last reply, when it gave any
-        self.review_reasoning_effort = None
+        self.review_reasoning_effort = os.getenv("AI_REVIEW_EFFORT") or None
         if config_path is None and config_overrides is not None:
             # Config-only: a host that ships this module alone (the calibre plugin)
             # describes the provider entirely in overrides; no file is read.
@@ -1890,20 +1916,22 @@ class AIService:
                         )
 
                 if self.provider == "claude":
-                    text = claude_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system)
+                    text = claude_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system,
+                                       effort=self._effort(model_type, model))
                     if text.strip():
                         return text
                     self._log(f"[claude] returned empty content on attempt {attempt + 1}")
 
                 elif self.provider == "commandcode":
-                    text = commandcode_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system)
+                    text = commandcode_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system,
+                                            effort=self._effort(model_type, model))
                     if text.strip():
                         return text
                     self._log(f"[commandcode] returned empty content on attempt {attempt + 1}")
 
                 elif self.provider == "opencode":
                     return opencode_chat(model_to_use, request_prompt, timeout=self.cli_timeout, system=system,
-                                         max_output=completion_tokens)
+                                         max_output=completion_tokens, effort=self._effort(model_type, model))
 
                 elif self.provider == "google" and self.client is not None:
                     # Gemini API
@@ -1960,7 +1988,7 @@ class AIService:
                         if self.provider == "openai":
                             client_kwargs["service_tier"] = "flex"
                         client_kwargs["max_output_tokens"] = completion_tokens
-                        client_kwargs.update(self._reasoning_options(model_type, responses=True))
+                        client_kwargs.update(self._reasoning_options(model_type, responses=True, model=model))
                         resp = self.client.responses.create(**client_kwargs)
                     except Exception as e:
                         last_error = e
@@ -2022,7 +2050,7 @@ class AIService:
                             timeout=self.timeout,
                             **{token_arg: completion_tokens},
                             **options,
-                            **self._reasoning_options(model_type),
+                            **self._reasoning_options(model_type, model=model),
                         )
                         if self.config.get("stream"):
                             resp = self._join_stream(resp)
@@ -2074,7 +2102,7 @@ class AIService:
                         url = self.base_url.rstrip("/") + "/responses"
                         payload = {"model": model_to_use, "input": request_prompt,
                                    "max_output_tokens": completion_tokens}
-                    options = self._reasoning_options(model_type, responses=url.endswith('/responses'))
+                    options = self._reasoning_options(model_type, responses=url.endswith('/responses'), model=model)
                     payload.update(options.get('extra_body', options))
                     try:
                         r = self.session.post(url, json=payload, timeout=self.timeout)

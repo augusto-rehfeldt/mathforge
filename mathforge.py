@@ -117,7 +117,7 @@ DEFAULT_MAX_TOKENS = 32000
 # rejected by providers that do not know it, so it stays opt-in.
 DEFAULT_EFFORT = "medium"  # the work model: proving, falsifying, formalizing
 DEFAULT_REVIEW_EFFORT = "high"  # the review model: the gates are worth the extra thinking
-EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "provider-default")
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "provider-default")
 USER_AGENT = "mathforge/1.0 (automated novelty check; contact: local user)"
 ARXIV_DELAY = 3.0  # arXiv asks for one request every 3 seconds
 AIRAXIV_DELAY = 1.0  # a small site; its novelty search is a page fetch
@@ -959,6 +959,18 @@ def setup_lean(project: Path) -> int:
     (project / LEAN_READY).write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
     print(f"Lean project ready at {project}.")
     return 0
+
+
+def resolve_efforts(flag: str | None, review_flag: str | None, asked: bool, env=os.environ) -> tuple[str, str]:
+    """(work, review) effort. A flag wins. Otherwise the shared menu's pick for that
+    role's model: when the menu was asked, no pick means the provider's own default;
+    unattended, no remembered pick means the built-in default.
+    """
+    # ponytail: an unattended run cannot tell "never asked" from a remembered "default"
+    # pick, so both get the built-in default; pass --effort provider-default to force it.
+    blank = ("provider-default",) * 2 if asked else (DEFAULT_EFFORT, DEFAULT_REVIEW_EFFORT)
+    return (flag or env.get("AI_WRITING_EFFORT") or blank[0],
+            review_flag or env.get("AI_REVIEW_EFFORT") or blank[1])
 
 
 def set_reasoning_effort(ai: AIService, effort: str, review_effort: str | None = None) -> bool:
@@ -2988,19 +3000,18 @@ def main(argv=None) -> int:
     )
     ap.add_argument(
         "--effort",
-        default=DEFAULT_EFFORT,
         choices=EFFORTS,
-        help="reasoning effort per call on the work model. An empty reply with "
-             "finish_reason=length is the model thinking past its output allowance; lower "
-             "this when that happens. `xhigh` only exists on some OpenAI-compatible "
-             "providers and is rejected elsewhere (default %(default)s)",
+        help="reasoning effort per call on the work model, overriding the menu's pick. An "
+             "empty reply with finish_reason=length is the model thinking past its output "
+             "allowance; lower this when that happens. `xhigh` only exists on some "
+             "OpenAI-compatible providers and is rejected elsewhere (default: the menu's "
+             f"pick, else {DEFAULT_EFFORT})",
     )
     ap.add_argument(
         "--review-effort",
-        default=DEFAULT_REVIEW_EFFORT,
         choices=EFFORTS,
         help="reasoning effort on the review model (proposing, refereeing, novelty, "
-             "independent check; default %(default)s)",
+             f"independent check; default: the menu's pick, else {DEFAULT_REVIEW_EFFORT})",
     )
     ap.add_argument(
         "--resume",
@@ -3087,6 +3098,7 @@ def main(argv=None) -> int:
 
     load_local_env()
     load_local_env(HERE / ".env")  # this project's own .env (AIRAXIV_API_KEY), beside the ai-suite one
+    interactive = False
     if args.config:
         args.model = args.model or DEFAULT_MODEL
         args.review_model = args.review_model or DEFAULT_REVIEW_MODEL
@@ -3111,7 +3123,8 @@ def main(argv=None) -> int:
     os.environ["AI_WRITING_COMPLETION_TOKENS"] = str(args.max_tokens)
     os.environ["AI_REVIEW_COMPLETION_TOKENS"] = str(args.max_tokens)
     ai = AIService(config_path=args.config)
-    review_effort = args.review_effort or args.effort
+    # The shared menu asked an effort per role, from the levels that role's model lists.
+    args.effort, review_effort = resolve_efforts(args.effort, args.review_effort, interactive)
     effort_supported = set_reasoning_effort(ai, args.effort, review_effort)
 
     log(f"models      {args.model} (work) / {args.review_model} (review)")
@@ -3367,6 +3380,13 @@ def _selftest() -> None:
     assert fake._reasoning_options('review', responses=True) == {'reasoning': {'effort': 'low'}}
     assert set_reasoning_effort(fake, 'provider-default')
     assert fake._reasoning_options('review') == {}
+    # A flag wins; an asked menu's per-model pick is next and its "default" is the provider's
+    # own; unattended, a remembered pick or else the built-in defaults.
+    picks = {"AI_WRITING_EFFORT": "max"}
+    assert resolve_efforts(None, None, True, picks) == ("max", "provider-default")
+    assert resolve_efforts("low", None, True, picks) == ("low", "provider-default")
+    assert resolve_efforts(None, None, False, picks) == ("max", DEFAULT_REVIEW_EFFORT)
+    assert resolve_efforts(None, "xhigh", False, {}) == (DEFAULT_EFFORT, "xhigh")
 
     # proposal fan-out: one call each, duplicates and dud replies dropped, rest kept
     shutil.rmtree(tmp, ignore_errors=True)

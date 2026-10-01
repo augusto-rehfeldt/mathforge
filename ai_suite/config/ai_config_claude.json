@@ -17,6 +17,10 @@
       "name": "Claude Fable 5.1 (CLI)",
       "max_output": 0
     },
+    "claude-sonnet-5-5": {
+      "name": "Claude Sonnet 5.5 (CLI)",
+      "max_output": 0
+    },
     "claude-sonnet-5": {
       "name": "Claude Sonnet 5 (CLI)",
       "max_output": 0

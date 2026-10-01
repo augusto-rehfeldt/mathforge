@@ -170,8 +170,12 @@ no longer needs the API-key route. On `ai_config_openai.local.json`,
 completion-token cap, so `--max-tokens` is advisory there. Reasoning effort is
 the knob that bites — an empty reply with `finish_reason=length` means the model
 spent its whole allowance thinking, and the fix is a *lower* `--effort`.
-`--effort` sets the writing role and `--review-effort` sets the review role, including
-when both roles use the same model. AIService applies the request shape appropriate
+Effort comes from the shared menu, which asks one per role from the levels that role's
+model lists (`resolve_efforts`): a `--effort` / `--review-effort` flag wins, then the
+menu's pick (`AI_WRITING_EFFORT` / `AI_REVIEW_EFFORT`); with no pick an attended run
+sends the provider's default and an unattended or `--config` run falls back to
+`DEFAULT_EFFORT` / `DEFAULT_REVIEW_EFFORT`. The roles keep separate efforts even
+when both use the same model. AIService applies the request shape appropriate
 to Responses or Chat Completions. Run the workspace book-writer/music-writer/mathforge
 checks together after changing that public contract.
 

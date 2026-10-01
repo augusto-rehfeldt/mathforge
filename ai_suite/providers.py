@@ -19,7 +19,8 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from .service import ensure_openai_oauth_proxy, load_opencode_go_sync, background_process_options
+from .service import (EFFORT_PROVIDERS, ensure_openai_oauth_proxy, load_opencode_go_sync,
+                      background_process_options)
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -118,7 +119,14 @@ AA_ALIASES = {
     "qwen3.8-flash": "qwen3-8-flash-next",
     # OpenCode's stealth model; GLM-4.6 by community identification, never confirmed.
     "big-pickle": "glm-4-6",
+    # Command Code's "high-speed GLM-5.3 Flash".
+    "glm-5.3-flashx": "glm-5-3-flash",
 }
+# Serving tiers of the same weights (kimi-k2.7-code-highspeed, hy3-paid); tried only
+# when the full name misses, since grok-4-fast is its own model.
+AA_SERVING_WORDS = frozenset("fast highspeed ultraspeed paid".split())
+# A model without a score triggers a background refetch at most this often.
+AA_RETRY_SECONDS = 3600
 # Paid through a subscription, so the price shown is only the API list rate.
 SUBSCRIPTION_PROVIDERS = ("claude", "commandcode", "opencode-go", "openai-oauth")
 
@@ -154,22 +162,54 @@ def _artificial_analysis() -> list:
             return json.loads(AA_CACHE.read_text(encoding="utf-8"))
     except Exception:
         pass
-    key = os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "").strip()
-    if key:
-        try:
-            req = Request(AA_URL, headers={"x-api-key": key, "User-Agent": "ai-book-creator"})
-            with urlopen(req, timeout=10) as resp:
-                data = json.load(resp).get("data") or []
-            if data:
-                AA_CACHE.parent.mkdir(parents=True, exist_ok=True)
-                AA_CACHE.write_text(json.dumps(data), encoding="utf-8")
-                return data
-        except Exception:
-            pass
+    data = _fetch_artificial_analysis()
+    if data:
+        return data
     try:
         return json.loads(AA_CACHE.read_text(encoding="utf-8"))
     except Exception:
         return []
+
+
+def _fetch_artificial_analysis() -> list:
+    """Live Artificial Analysis list, saved to AA_CACHE; [] without a key or on failure."""
+    key = os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "").strip()
+    if not key:
+        return []
+    try:
+        req = Request(AA_URL, headers={"x-api-key": key, "User-Agent": "ai-book-creator"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.load(resp).get("data") or []
+        if data:
+            AA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            AA_CACHE.write_text(json.dumps(data), encoding="utf-8")
+        return data
+    except Exception:
+        return []
+
+
+def _refresh_missing_intelligence(mids) -> bool:
+    """Refetch Artificial Analysis in a detached process when a model has no score yet.
+
+    The menu never waits: new scores show on the next load. Runs at most once per
+    AA_RETRY_SECONDS (the cache mtime marks the last fetch). True when started.
+    """
+    if not os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "").strip():
+        return False
+    if all(_intelligence(mid) is not None for mid in mids):
+        return False
+    try:
+        if time.time() - AA_CACHE.stat().st_mtime < AA_RETRY_SECONDS:
+            return False
+    except OSError:
+        pass
+    subprocess.Popen(
+        [sys.executable, "-c", "from ai_suite.providers import _fetch_artificial_analysis as f; f()"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        **background_process_options(),
+    )
+    return True
 
 
 def _name_key(name: str) -> tuple[tuple[str, ...], frozenset[str]]:
@@ -188,6 +228,14 @@ def _intelligence(mid: str) -> float | None:
     tail = mid.lower().rsplit("/", 1)[-1]
     numbers, words = _name_key(AA_ALIASES.get(tail, tail))
     words -= {"preview", "exp"}  # not "max": gpt-5.1-codex-max is its own model
+    for key in dict.fromkeys((words, words - AA_SERVING_WORDS)):
+        best = _intelligence_match(numbers, key)
+        if best is not None:
+            return best
+    return None
+
+
+def _intelligence_match(numbers: tuple, words: frozenset) -> float | None:
     best = None
     for entry in _artificial_analysis():
         score = (entry.get("evaluations") or {}).get("artificial_analysis_intelligence_index")
@@ -380,11 +428,16 @@ def _cli_listing(args: list[str], cache: Path) -> str:
             return cache.read_text(encoding="utf-8")
     except OSError:
         pass
-    listing = subprocess.run(
-        [shutil.which(args[0]) or args[0], *args[1:]],
-        capture_output=True, text=True, encoding="utf-8", timeout=15, check=True,
-        **background_process_options(),
-    ).stdout
+    try:
+        listing = subprocess.run(
+            [shutil.which(args[0]) or args[0], *args[1:]],
+            capture_output=True, text=True, encoding="utf-8", timeout=30, check=True,
+            **background_process_options(),
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        if cache.exists():  # a stale listing beats an empty menu
+            return cache.read_text(encoding="utf-8")
+        raise
     if listing.strip():
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(listing, encoding="utf-8")
@@ -404,6 +457,16 @@ def _live_model_ids(provider: str) -> set[str] | None:
             listing = _cli_listing(["opencode", "models", "opencode"], OPENCODE_MODELS_CACHE)
             return {line.strip().split("/", 1)[1].lower() for line in listing.splitlines()
                     if line.strip().startswith("opencode/")} or None
+        if provider == "claude":
+            # The CLI can't list models; models.dev names each family's newest release
+            # (on a same-day tie the shorter id: the bare one, not its dated snapshot).
+            newest: dict = {}
+            for mid, info in ((_models_dev().get("anthropic") or {}).get("models") or {}).items():
+                family = info.get("family")
+                key = (info.get("release_date", ""), -len(mid))
+                if family and (family not in newest or key > newest[family][0]):
+                    newest[family] = (key, mid.lower())
+            return {mid for _, mid in newest.values()} or None
         with open(PROVIDER_CONFIG_MAP[provider], "r", encoding="utf-8") as f:
             data = json.load(f)
         if not data.get("base_url"):
@@ -440,8 +503,15 @@ def _load_catalogue(provider: str) -> dict:
                 out[mid][1] = int(info["max_output"])
     # Drop curated ids the provider has retired, so the menu never offers a
     # dead model. Offline or unreachable: keep the curated list as is.
-    live = _live_model_ids(provider) if provider != "claude" else None
-    if live and (provider in LOCAL_PROVIDERS or any(mid in live for mid in out)):
+    live = _live_model_ids(provider)
+    if live and provider == "claude":
+        # Only a newest-per-family list, so it adds but never retires; the CLI takes no cap.
+        for mid in sorted(live):
+            # Skip it when listed bare or as a dated snapshot (claude-haiku-4-5-20251001),
+            # but claude-opus-5-5 does not stand in for claude-opus-5.
+            if not any(re.fullmatch(re.escape(mid) + r"(-\d{8})?", have) for have in out):
+                out[mid] = [mid, 0]
+    elif live and (provider in LOCAL_PROVIDERS or any(mid in live for mid in out)):
         out = {mid: entry for mid, entry in out.items() if mid in live}
         # And offer what the provider added since the list was curated, when
         # models.dev can say how much it writes (skips image/embedding ids). The
@@ -875,6 +945,32 @@ def _prompt_catalogue_model(provider: str, default_model: str, role: str = "") -
     return _pick_model(label, rows, default_model, role, paid_by)
 
 
+def _effort_levels(provider: str, mid: str) -> list[str]:
+    """Reasoning efforts models.dev lists for the model; [] when it lists none or the
+    provider's transport cannot send one."""
+    if provider == "gpt4free":
+        # ponytail: its facts are a fuzzy name match and whether the g4f server forwards
+        # an effort is unchecked; offer levels once a live request confirms it.
+        return []
+    with open(provider_config_path(provider), "r", encoding="utf-8") as f:
+        if str(json.load(f).get("provider", "")).lower() not in EFFORT_PROVIDERS:
+            return []
+    for option in _models_dev_facts(provider, mid).get("reasoning_options") or ():
+        if option.get("type") == "effort":
+            return [str(level) for level in option.get("values") or ()]
+    return []
+
+
+def _prompt_effort(levels: list[str], default: str, role: str = "") -> str:
+    """Arrow-key effort menu: the model's own levels, or "" for the provider's default."""
+    name = f"{role.capitalize()} effort" if role else "Effort"
+    rows = [("default", "default  the provider's own")] + [(level, level) for level in levels]
+    # ponytail: asked on a console only. Off one the remembered pick stands, because a
+    # typed prompt here would eat the next scripted answer of a piped run.
+    picked = _arrow_menu(name, rows, default or "default", name=name)
+    return default if picked is None else "" if picked == "default" else picked
+
+
 
 
 def provider_options() -> dict[str, dict]:
@@ -917,6 +1013,7 @@ def choose_ai(
     roles: tuple[str, ...] = ("writing",),
     defaults: tuple[str, ...] = (),
     default_provider: str = "google",
+    effort: bool = True,
 ) -> tuple[str, str, list[str]]:
     """Provider and model menu shared by every script that uses AIService.
 
@@ -925,7 +1022,9 @@ def choose_ai(
     each of them. Asks for the provider unless one is given, then one model per
     role (the first role writes, the last reviews). mode="auto" asks nothing and
     reuses the picks remembered in state_file (default: PROVIDER_STATE_FILE).
-    Exports AI_CONFIG_PATH, the role models and completion caps; returns
+    Each model that lists reasoning efforts then gets an effort menu of its own
+    levels; effort=False skips it for a caller with its own effort option.
+    Exports AI_CONFIG_PATH, the role models, efforts and completion caps; returns
     (provider, config path, models).
     """
     if provider is None:
@@ -945,7 +1044,7 @@ def choose_ai(
         # cached) before the first menu can draw; say so instead of sitting silent.
         with _loading(f"{PROVIDER_LABELS.get(provider, provider)} models"):
             if provider in CATALOGUE_PROVIDERS:
-                _provider_models(provider)
+                _refresh_missing_intelligence(_provider_models(provider))
             _models_dev()
             _artificial_analysis()
     if provider in ("openai", "openai-oauth"):
@@ -956,7 +1055,8 @@ def choose_ai(
         base_key = "openai_oauth_model" if provider == "openai-oauth" else "openai_model"
         for i, role in enumerate(roles):
             key = base_key if i == 0 else f"{base_key}_{role}"
-            fallback = defaults[i] if i < len(defaults) else (
+            # A role with no pick of its own yet starts on the first role's.
+            fallback = defaults[i] if i < len(defaults) else models[0] if i else (
                 "gpt-6-sol" if provider == "openai-oauth" else None)
             default_model = _load_last_openai_model(fallback, options, key, state_file)
             models.append(default_model if mode == "auto"
@@ -969,7 +1069,7 @@ def choose_ai(
     elif provider in CATALOGUE_PROVIDERS:
         for i, role in enumerate(roles):
             key = _model_state_key(provider) + ("" if i == 0 else f"_{role}")
-            fallback = defaults[i] if i < len(defaults) else None
+            fallback = defaults[i] if i < len(defaults) else models[0] if i else None
             default_model = _load_last_catalogue_model(provider, fallback, key, state_file)
             models.append(default_model if mode == "auto"
                           else _prompt_catalogue_model(provider, default_model, label(role)))
@@ -1000,12 +1100,36 @@ def choose_ai(
             print(f"Model {mid}: {_facts_label(_model_facts(provider, mid))} ($ per 1M in/out)")
         models = [writing] + [review] * (len(roles) - 1)
 
+    # One effort per role, from the levels that role's model lists; AIService reads the
+    # first as the writing effort and the last as the review effort.
+    saved = _load_provider_state(state_file)
+    efforts: list[str] = []
+    answered: dict[str, str] = {}  # only an answered menu is remembered
+    for i, (role, mid) in enumerate(zip(roles, models)):
+        key = f"{provider.replace('-', '_')}_effort" + ("" if i == 0 else f"_{role}")
+        # Like the models: a role with no remembered effort starts on the first role's.
+        last = str(saved[key] if key in saved else efforts[0] if efforts else "")
+        picked = ""
+        # Auto mode with nothing remembered never loads models.dev.
+        if effort and mid and (mode != "auto" or last):
+            levels = _effort_levels(provider, mid)
+            # models.dev unreachable says nothing about the model: the remembered effort stands.
+            picked = last if last in levels or not _models_dev() else ""
+            if levels and mode != "auto":
+                picked = answered[key] = _prompt_effort(levels, picked, label(role))
+        efforts.append(picked)
+    for name, picked in (("AI_WRITING_EFFORT", efforts[0]), ("AI_REVIEW_EFFORT", efforts[-1])):
+        if picked:
+            os.environ[name] = picked
+        else:
+            os.environ.pop(name, None)
+
     first = models[0] if state_keys else None
     _save_last_provider(
         provider,
         first if provider in ("openai", "openai-oauth") else None,
         first if provider in CATALOGUE_PROVIDERS else None,
         state_file,
-        dict(zip(state_keys[1:], models[1:])),
+        {**dict(zip(state_keys[1:], models[1:])), **answered},
     )
     return provider, config_path, models
