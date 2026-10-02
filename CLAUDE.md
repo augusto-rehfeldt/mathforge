@@ -260,8 +260,11 @@ a heading that carries the whole statement (nothing under it, or only a list) be
 body; an empty lead-in proof is dropped; after a numbered verification, limitations or
 novelty section (`_AFTER_RESULTS`) no environment opens, because `Theorem 1` there heads
 a search log or a query list. `_stars` escapes `*` used as multiplication and `_plain` also handles a spaced
-backslash and `[n](x)` in plain-text statements, both through `_outside_math` so math and
-code are untouched. `latex_document` calls pandoc with `tex_math_single_backslash` on and
+backslash, `A\B` between one-letter set names (it reached LaTeX as the command `\B`), `_`
+(two of them paired up as emphasis) and `[n](x)` in plain-text statements, both through
+`_outside_math` so math and code are untouched. unicode-math redefines `∑`, `∏` and `′` at
+`\begin{document}` as math-only; the preamble re-wraps them after it (`\let\mfsum=∑`), since
+a statement that writes them in running text otherwise stops the build. `latex_document` calls pandoc with `tex_math_single_backslash` on and
 `superscript`/`subscript` off (papers write `\(..\)`, statements write `x^{k}`), then
 splices `_LATEX_PREAMBLE` (amsthm environments, `newunicodechar` for `_UNICODE_TEX`).
 

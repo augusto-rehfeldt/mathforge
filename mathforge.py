@@ -2267,16 +2267,23 @@ _UNICODE_TEX = {
     "∅": r"\emptyset", "∖": r"\setminus", "∞": r"\infty", "∑": r"\sum", "∏": r"\prod", "∎": r"\blacksquare", "∣": r"\mid",
     "∤": r"\nmid", "⌊": r"\lfloor", "⌋": r"\rfloor", "⌈": r"\lceil", "⌉": r"\rceil", "ℤ": r"\mathbb{Z}",
     "ℕ": r"\mathbb{N}", "𝔽": r"\mathbb{F}", "²": "^2", "³": "^3", "⁻": "^{-}", "ⱼ": "_j", "ₘ": "_m", "ₙ": "_n",
+    "ᵢ": "_i", "₊": "_{+}", "ᵀ": "^T", "ᵃ": "^a", "ᵈ": "^d", "ᵉ": "^e", "′": "'","ℓ": r"\ell",
+    "↦": r"\mapsto", "⋯": r"\cdots",
     **{chr(0x2080 + d): f"_{d}" for d in range(10)},
-    **dict(zip("αβγδελμνπρστφχψω", ("\\" + name for name in "alpha beta gamma delta epsilon lambda mu nu pi rho sigma "
-                                    "tau phi chi psi omega".split()))),
+    **dict(zip("αβγδεηλμνπρστφχψω", ("\\" + name for name in "alpha beta gamma delta epsilon eta lambda mu nu pi rho "
+                                     "sigma tau phi chi psi omega".split()))),
 }
-# Latin Modern Math has no glyph for unicode-math's \setminus; \notni is a macro a paper used undefined
+# Latin Modern Math has no glyph for unicode-math's \setminus; \notni is a macro a paper used undefined.
+# unicode-math redefines ∑, ∏ and ′ at \begin{document} as math-only, so one in running text stopped
+# the build with "Missing $ inserted". Their text form is made after that, wrapping the meaning
+# unicode-math gave the character (its \sum expands to the character, so naming \sum would loop).
 _LATEX_PREAMBLE = ("\\usepackage{amsthm}\n\\usepackage{newunicodechar}\n\\providecommand{\\notni}{\\nni}\n"
                    "\\AtBeginDocument{\\renewcommand{\\setminus}{\\mathbin{\\backslash}}}\n\\emergencystretch=3em\n") + "".join(
     f"\\newtheorem{{{k}}}{{{k.capitalize()}}}\n\\newtheorem*{{{k}*}}{{{k.capitalize()}}}\n"
     for k in _KINDS.lower().split("|")
-) + "".join(f"\\newunicodechar{{{ch}}}{{\\ensuremath{{{tex}}}}}\n" for ch, tex in _UNICODE_TEX.items())
+) + "".join(f"\\newunicodechar{{{ch}}}{{\\ensuremath{{{tex}}}}}\n" for ch, tex in _UNICODE_TEX.items()) + "".join(
+    f"\\AtBeginDocument{{\\let\\mf{name}={ch}\\newunicodechar{{{ch}}}{{\\ensuremath{{\\mf{name}}}}}}}\n"
+    for ch, name in (("∑", "sum"), ("∏", "prod"), ("′", "prime")))
 
 
 def _outside_math(text: str, fn) -> str:
@@ -2294,9 +2301,13 @@ def _stars(text: str) -> str:
 
 
 def _plain(text: str) -> str:
-    """A plain-text statement as Markdown: besides `*`, a spaced backslash is set difference, not an
-    escape, and `F_[n](x,y)` is not a link."""
-    return _outside_math(_stars(text), lambda s: re.sub(r"(?<= )\\(?= )", "∖", s).replace("](", "]&#40;").replace("<", "\\<"))
+    """A plain-text statement as Markdown: besides `*`, a backslash that is spaced or stands before a
+    one-letter set name (`A\\B`) is set difference, not an escape or a command, `F_[n](x,y)` is not a
+    link, and `_` is a subscript, never emphasis."""
+    def prose(s: str) -> str:
+        s = re.sub(r"(?<= )\\(?= )|(?<=[\w)\]])\\(?=[A-Z](?![A-Za-z]))", "∖", s)
+        return re.sub(r"(?<!\\)_", r"\\_", s).replace("](", "]&#40;").replace("<", "\\<")
+    return _outside_math(_stars(text), prose)
 
 
 def _tex_note(text: str) -> str:
@@ -2659,6 +2670,11 @@ def _airaxiv_http(url: str, method: str = "POST", body: bytes | None = None, hea
         return dict(response.headers), response.read()
 
 
+def _airaxiv_busy(exc: Exception) -> bool:
+    """The site is throttling (rate limit, daily quota): about the caller, not the paper, so the batch ends."""
+    return getattr(exc, "code", None) == 429 or any(w in str(exc).lower() for w in ("too many requests", "quota"))
+
+
 def _airaxiv_reason(exc: Exception) -> str:
     """An upload failure in one line; for an HTTP refusal, with the wait the site asks for and what it said."""
     reason = f"{type(exc).__name__}: {exc}"
@@ -2797,7 +2813,7 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
                 except (RuntimeError, urllib.error.HTTPError) as refusal:
                     # the site said no, so nothing was accepted. A busy site may be asked again later; a paper it
                     # turned down is kept out of the queue until its PDF changes, or it would be refused every call
-                    if isinstance(refusal, RuntimeError) and "too many requests" not in str(refusal).lower():
+                    if isinstance(refusal, RuntimeError) and not _airaxiv_busy(refusal):
                         record[stem] = {"title": title, "refused": stamp, "state": "refused",
                                         "error": str(refusal)[:300], "sha256": digest}
                     else:
@@ -2807,8 +2823,8 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
             except Exception as exc:  # one paper's failure, whatever it is, must not skip the session clean-up
                 failed += 1
                 log(f"airaxiv: {stem[:50]:<50} FAILED: {_airaxiv_reason(exc)[:300]}")
-                if "too many requests" in str(exc).lower() or getattr(exc, "code", None) == 429:
-                    log(f"airaxiv: rate limit reached; {len(pending) - pending.index(stem)} paper(s) left for a later call")
+                if _airaxiv_busy(exc):
+                    log(f"airaxiv: rate limit or daily quota reached; {len(pending) - pending.index(stem)} paper(s) left for a later call")
                     break
                 continue
             record[stem] = {"title": title, "submitted": stamp, "reply": reply}
@@ -3893,7 +3909,12 @@ def _selftest() -> None:
     assert _tex_note("of \\(F_n\\) and $a*b$, *it*") == "of \\(F_n\\) and $a*b$, it", _tex_note("of \\(F_n\\) and $a*b$, *it*")
     # `*` as multiplication is not emphasis; math, code and real emphasis are left alone
     assert _stars("4*I(A)*I(B), *it*, **b**, $a*b$, \\(c*d\\), `e*f`") == "4\\*I(A)\\*I(B), *it*, **b**, $a*b$, \\(c*d\\), `e*f`"
-    assert _plain("2*s = k*(m+1), $a \\ b$, [n] \\ (A), F_[n](x)") == "2\\*s = k\\*(m+1), $a \\ b$, [n] ∖ (A), F_[n]&#40;x)"
+    # `_` is escaped too: `∑_{i=0}^{n−1}a_i … ∑_{j}` paired two underscores up as emphasis
+    assert _plain("2*s = k*(m+1), $a \\ b$, [n] \\ (A), F_[n](x)") == "2\\*s = k\\*(m+1), $a \\ b$, [n] ∖ (A), F\\_[n]&#40;x)"
+    assert _plain("A(x)=∑_{i=0}a_i, $x_1$, `a_b`, done\\_") == "A(x)=∑\\_{i=0}a\\_i, $x_1$, `a_b`, done\\_"
+    # unicode-math claims ∑ and ∏ at \begin{document}, so their text form is made after it
+    assert all(ch in _UNICODE_TEX for ch in "ηᵀᵃᵈᵉᵢ′₊ℓ↦⋯"), "glyphs the refutations note printed as missing"
+    assert "\\AtBeginDocument{\\let\\mfsum=∑\\newunicodechar{∑}{\\ensuremath{\\mfsum}}}" in _LATEX_PREAMBLE
     fed = pandoc_input("# T\n\n## Abstract\n\na*b\n\n## 1. R\n\n" + "".join(f"x{n}" + "\\" * n + "\n" for n in range(2, 7)), "me")
     assert all(f"x{n}\\\\\n" in fed for n in range(2, 7)), fed  # a row break is two backslashes, however many were written
     assert '"author": ["me"]' in fed and "not reviewed by a person" in fed and '"abstract": "a\\\\*b"' in fed, fed
@@ -3911,9 +3932,10 @@ def _selftest() -> None:
     assert note_envs.index("\\end{proof}") < note_envs.index("Lean 4 + Mathlib"), note_envs  # the record is not part of the proof
     assert paper_meta(note)[0].startswith("1 machine-checked"), paper_meta(note)[0]  # a leading count is not a section number
     minus = refutations_note([("s", {"id": "c1", "status": "machine-refuted",
-                                     "statement": "R = [n] \\ (A ∪ B) and $a\\ b$, F_[n](x,y)"}, {}, "")])
-    # plain-text statements: a spaced backslash is set difference, and `[n](x,y)` is not a link
-    assert "R = [n] ∖ (A ∪ B) and $a\\ b$, F_[n]&#40;x,y)" in minus and "recorded in the scripts" in minus, minus
+                                     "statement": "R = [n] \\ (A ∪ B) and $a\\ b$, F_[n](x,y), A\\B, x\\geq y"}, {}, "")])
+    # plain-text statements: a backslash that is spaced, or sits between two sets, is set difference
+    # (`A\B` reached LaTeX as the undefined command \B), and `[n](x,y)` is not a link
+    assert "R = [n] ∖ (A ∪ B) and $a\\ b$, F\\_[n]&#40;x,y), A∖B, x\\geq y" in minus and "recorded in the scripts" in minus, minus
     real_gh = globals()["_gh"]
 
     def _no_git(*a, **k):
@@ -4050,6 +4072,21 @@ def _selftest() -> None:
         globals()["_airaxiv_http"] = _limited
         assert submit_airaxiv(9) == 1 and titles_seen == [1], titles_seen
         assert json.loads((pack / "airaxiv.json").read_text(encoding="utf-8")) == {}, "a rate limit is not a refusal of the paper"
+        # nor is the daily quota, which the site reports at submit_paper: stop, and offer the paper again tomorrow
+        quota_hits = []
+
+        def _quota(url, method="POST", body=None, headers=None):
+            message = json.loads(body) if method == "POST" and body else {}
+            if message.get("params", {}).get("name") == "submit_paper":
+                quota_hits.append(1)
+                refusal = {"isError": True, "content": [{"text": "Daily quota exceeded. Please try again tomorrow."}]}
+                return {}, json.dumps({"jsonrpc": "2.0", "id": 1, "result": refusal}).encode()
+            return _fake_airaxiv(url, method, body, headers)
+
+        globals()["_airaxiv_http"] = _quota
+        assert submit_airaxiv(9) == 1 and quota_hits == [1], quota_hits
+        assert json.loads((pack / "airaxiv.json").read_text(encoding="utf-8")) == {}, "a quota is not a refusal of the paper"
+        assert _airaxiv_busy(RuntimeError("submit_paper: Daily quota exceeded")) and not _airaxiv_busy(RuntimeError("bad PDF"))
     finally:
         globals()["OUTPUT_ROOT"], globals()["_airaxiv_http"] = real_root, real_http
         os.environ.pop("AIRAXIV_API_KEY", None)
