@@ -1039,6 +1039,27 @@ def choose_ai(
     models: list[str] = []
     state_keys: list[str] = []
     label = lambda role: role if len(roles) > 1 else ""
+
+    # One effort per role, asked right after that role's model from the levels the model
+    # lists; AIService reads the first as the writing effort and the last as the review effort.
+    saved = _load_provider_state(state_file)
+    efforts: list[str] = []
+    answered: dict[str, str] = {}  # only an answered menu is remembered
+
+    def pick_effort(role: str, mid: str) -> None:
+        key = f"{provider.replace('-', '_')}_effort" + (f"_{role}" if efforts else "")
+        # Like the models: a role with no remembered effort starts on the first role's.
+        last = str(saved[key] if key in saved else efforts[0] if efforts else "")
+        picked = ""
+        # Auto mode with nothing remembered never loads models.dev.
+        if effort and mid and (mode != "auto" or last):
+            levels = _effort_levels(provider, mid)
+            # models.dev unreachable says nothing about the model: the remembered effort stands.
+            picked = last if last in levels or not _models_dev() else ""
+            if levels and mode != "auto":
+                picked = answered[key] = _prompt_effort(levels, picked, label(role))
+        efforts.append(picked)
+
     if mode != "auto" and (provider in CATALOGUE_PROVIDERS or provider in ("openai", "openai-oauth")):
         # The live catalogue, models.dev and Artificial Analysis are all fetched (and
         # cached) before the first menu can draw; say so instead of sitting silent.
@@ -1063,6 +1084,7 @@ def choose_ai(
                           else _prompt_openai_model(default_model, model_info, label(role),
                                                      provider == "openai-oauth"))
             state_keys.append(key)
+            pick_effort(role, models[-1])
         os.environ["AI_WRITING_MODEL"] = models[0]
         os.environ["AI_REVIEW_MODEL"] = models[-1]
         os.environ["AI_OPENAI_MODEL"] = models[0]
@@ -1074,6 +1096,7 @@ def choose_ai(
             models.append(default_model if mode == "auto"
                           else _prompt_catalogue_model(provider, default_model, label(role)))
             state_keys.append(key)
+            pick_effort(role, models[-1])
         os.environ["AI_WRITING_MODEL"] = models[0]
         os.environ["AI_REVIEW_MODEL"] = models[-1]
         # The Claude Code CLI has no completion-token argument, so its catalogue
@@ -1099,25 +1122,9 @@ def choose_ai(
         for mid in dict.fromkeys(filter(None, (writing, review))):
             print(f"Model {mid}: {_facts_label(_model_facts(provider, mid))} ($ per 1M in/out)")
         models = [writing] + [review] * (len(roles) - 1)
+        for role, mid in zip(roles, models):
+            pick_effort(role, mid)
 
-    # One effort per role, from the levels that role's model lists; AIService reads the
-    # first as the writing effort and the last as the review effort.
-    saved = _load_provider_state(state_file)
-    efforts: list[str] = []
-    answered: dict[str, str] = {}  # only an answered menu is remembered
-    for i, (role, mid) in enumerate(zip(roles, models)):
-        key = f"{provider.replace('-', '_')}_effort" + ("" if i == 0 else f"_{role}")
-        # Like the models: a role with no remembered effort starts on the first role's.
-        last = str(saved[key] if key in saved else efforts[0] if efforts else "")
-        picked = ""
-        # Auto mode with nothing remembered never loads models.dev.
-        if effort and mid and (mode != "auto" or last):
-            levels = _effort_levels(provider, mid)
-            # models.dev unreachable says nothing about the model: the remembered effort stands.
-            picked = last if last in levels or not _models_dev() else ""
-            if levels and mode != "auto":
-                picked = answered[key] = _prompt_effort(levels, picked, label(role))
-        efforts.append(picked)
     for name, picked in (("AI_WRITING_EFFORT", efforts[0]), ("AI_REVIEW_EFFORT", efforts[-1])):
         if picked:
             os.environ[name] = picked
