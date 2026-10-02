@@ -334,6 +334,11 @@ def _short(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def _named(stem: str, text: str) -> str:
+    """A log line about one package: `name: text`."""
+    return f"{_short(stem, 44)}: {text}"
+
+
 def rule(title: str = "") -> None:
     _emit(f"\n{('── ' + title + ' ').ljust(78, '─') if title else '─' * 78}\n")
 
@@ -2278,7 +2283,9 @@ _UNICODE_TEX = {
 # the build with "Missing $ inserted". Their text form is made after that, wrapping the meaning
 # unicode-math gave the character (its \sum expands to the character, so naming \sum would loop).
 _LATEX_PREAMBLE = ("\\usepackage{amsthm}\n\\usepackage{newunicodechar}\n\\providecommand{\\notni}{\\nni}\n"
-                   "\\AtBeginDocument{\\renewcommand{\\setminus}{\\mathbin{\\backslash}}}\n\\emergencystretch=3em\n") + "".join(
+                   "\\AtBeginDocument{\\renewcommand{\\setminus}{\\mathbin{\\backslash}}}\n\\emergencystretch=3em\n"
+                   # a witness is printed as code, and a name like conclusion_A_equals_B has no other place to break
+                   "\\let\\mfunderscore\\_\n\\renewcommand{\\_}{\\mfunderscore\\allowbreak}\n") + "".join(
     f"\\newtheorem{{{k}}}{{{k.capitalize()}}}\n\\newtheorem*{{{k}*}}{{{k.capitalize()}}}\n"
     for k in _KINDS.lower().split("|")
 ) + "".join(f"\\newunicodechar{{{ch}}}{{\\ensuremath{{{tex}}}}}\n" for ch, tex in _UNICODE_TEX.items()) + "".join(
@@ -2623,13 +2630,13 @@ def _export_latex(out: Path, author: str, retry: bool) -> int:
                 (out / f"{stem}.md").write_text(markdown, encoding="utf-8")
                 tex_file.write_text(tex, encoding="utf-8")
                 status = build_pdf(out, stem)
-                log(f"export: {stem[:50]:<50} {status[:80]}")
+                log("export: " + _named(stem, _short(status, 100)))
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
             if "pandoc is not installed" in str(exc):
                 log("export: pandoc is not installed; no submission package written")
                 return EXPORT_ABORTED
             status = f"FAILED: {type(exc).__name__}: {exc}"
-            log(f"export: {stem[:50]:<50} {status[:80]}")
+            log("export: " + _named(stem, _short(status, 100)))
         statuses[stem] = status
         index += [f"## {title}", "", f"- Files: `{stem}.pdf`, `{stem}.tex`, `{stem}.md` ({status})",
                   *(f"- `{state}` {name} ({models})" for name, state, models in rows), "", abstract, ""]
@@ -2822,14 +2829,15 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
                     raise
             except Exception as exc:  # one paper's failure, whatever it is, must not skip the session clean-up
                 failed += 1
-                log(f"airaxiv: {stem[:50]:<50} FAILED: {_airaxiv_reason(exc)[:300]}")
+                log("airaxiv: " + _named(stem, "FAILED: " + _short(_airaxiv_reason(exc), 300)))
                 if _airaxiv_busy(exc):
                     log(f"airaxiv: rate limit or daily quota reached; {len(pending) - pending.index(stem)} paper(s) left for a later call")
                     break
                 continue
             record[stem] = {"title": title, "submitted": stamp, "reply": reply}
             save()
-            log(f"airaxiv: {stem[:50]:<50} submitted {json.dumps(reply, ensure_ascii=False)[:120]}")
+            paper = reply.get("paper") if isinstance(reply.get("paper"), dict) else reply
+            log("airaxiv: " + _named(stem, f"submitted as #{paper.get('submission_id', '?')}"))
     finally:
         try:
             _airaxiv_http(AIRAXIV_MCP, method="DELETE", headers={k: v for k, v in headers.items() if k != "Content-Type"})
@@ -3477,6 +3485,8 @@ def _selftest() -> None:
     assert len(asked) == 3 and asked[0].endswith("q=class+counts+in+unitriangular+groups") and nothing == [], asked
     assert search_airaxiv in [backend for backend, _gap in _backends()]
     assert _short("abc", 5) == "abc" and _short("abcdef", 5) == "abcd…"
+    # a package's log line: its name, cut if long, never padded out to a column
+    assert _named("_refutations", "ok") == "_refutations: ok" and _named("a" * 60, "ok") == "a" * 43 + "…: ok"
     assert found["errors"] == [], found["errors"]
     assert [h["title"] for h in found["hits"]] == [
         "On binomial sums", "A related paper", "Inverted abstract paper",
