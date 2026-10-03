@@ -127,8 +127,17 @@ RULES = """\
 Hard constraints on every conjecture you produce:
 - It must be ORIGINAL. Do not restate a named theorem, a textbook exercise, a
   known identity, or a famous open problem (Collatz, Goldbach, twin primes,
-  Riemann, ABC, Erdos-Straus, ...). Aim for a statement a specialist would call
-  "plausible, small, and apparently new", not "famous".
+  Riemann, ABC, Erdos-Straus, ...) in full. A tractable special case, analogue
+  or strengthening of an open question that specialists work on is welcome, and
+  is the best kind of target.
+- It must MATTER. Ask what a specialist would do with it. Prefer an exact formula,
+  a bijection, a sharp extremal bound with the extremal objects characterized, a
+  structure or classification theorem, or an unexpected link between two
+  invariants. Avoid a parity or divisibility curiosity about a count refined by
+  arbitrarily chosen statistics, and anything whose whole proof is one obvious
+  symmetry (a reversal involution, a free group action): those are true, new and
+  worthless. Be adventurous: a bold claim that may be refuted is worth more than
+  a safe one nobody would cite.
 - It must be FALSIFIABLE BY BRUTE FORCE: over explicit finite objects (integers,
   finite groups, graphs, words, lattice points, partitions, matrices over small
   fields), so a program can search for a counterexample in minutes.
@@ -139,9 +148,11 @@ Hard constraints on every conjecture you produce:
   The search space below is a finite SLICE of the infinite claim.
 - It must be FULLY FORMAL: every symbol quantified, every constant explicit. No
   "for sufficiently large n" without a stated bound. No undefined notation.
-- It must be PROVABLE by elementary means (induction, counting, pigeonhole,
-  generating functions, elementary number theory, linear algebra). If the only
-  plausible proof needs deep machinery, it is out of scope.
+- It must be PROVABLE by an argument that can be written out in full (induction,
+  bijections, transfer matrices, generating functions, linear algebra, character
+  sums, elementary number theory, extremal or probabilistic counting). A long,
+  multi-step proof is welcome. It is out of scope only if the one plausible proof
+  rests on machinery that cannot be reproduced on the page.
 """
 
 
@@ -1092,13 +1103,15 @@ class Forge:
             reply = self.run.stage(
                 f"conjecture{nth}",
                 lambda: self.ask(
-                    f"You are a research mathematician hunting for small NEW theorems in: {seed}\n\n"
+                    f"You are a research mathematician hunting for NEW theorems that matter in: {seed}\n\n"
                     f"{RULES}\n"
                     f"You are proposer {nth} of {count} working independently on this seed. "
                     "Pick an angle the others are unlikely to pick and propose exactly ONE "
                     "conjecture. Before writing it, silently check it against the literature "
                     "you know; discard anything you can name. Prefer a statement that "
-                    "combines two structures in a way you have not seen combined.\n\n"
+                    "combines two structures in a way you have not seen combined, or that "
+                    "settles a case of a question people in the area actually ask. Aim at the "
+                    "most important statement you believe is true, not the safest one.\n\n"
                     "Do not survey the area first and do not weigh many candidates: settle on "
                     "one early and spend the reply making it precise.\n\n"
                     "Return ONLY a JSON object:\n"
@@ -1108,7 +1121,9 @@ class Forge:
                     'with all quantifiers", "notation": "definitions of every symbol used", '
                     '"search_space": "the explicit finite family a program should search for a '
                     'counterexample, with concrete bounds", "why_plausible": "the heuristic or '
-                    'partial argument", "why_new": "why you believe this is not in the literature"}',
+                    'partial argument", "why_new": "why you believe this is not in the literature", '
+                    '"why_it_matters": "what open question, known theorem or line of work this '
+                    'advances, and what a specialist would do with it"}',
                     model_type="review",
                 ),
             )
@@ -1473,10 +1488,17 @@ class Forge:
         seed = str(self.ask_json(
             "Choose the next topic for an automated math research run. The pipeline can "
             "only keep results that are (a) checkable by brute force over explicit finite "
-            "objects and (b) provable by elementary means, so pick an area rich in small "
-            "concrete objects: integer sequences, finite words, graphs on few vertices, "
-            "partitions, lattice paths, finite groups or rings, matrices over small fields, "
-            "combinatorial designs, polynomial identities over Z.\n\n"
+            "objects and (b) provable by an argument that can be written out in full, so "
+            "pick an area rich in small concrete objects: integer sequences, finite words, "
+            "graphs on few vertices, partitions, lattice paths, finite groups or rings, "
+            "matrices over small fields, combinatorial designs, polynomial identities over Z.\n\n"
+            "Be adventurous and aim at importance. Choose an area where current research "
+            "has open questions (a conjecture with unsettled cases, an extremal problem "
+            "with a gap between bounds, an enumeration nobody has a formula for, a "
+            "structure nobody has classified) and where a tractable special case, analogue "
+            "or exact answer would be cited. Name that open question in the seed. Do not "
+            "choose a familiar object refined by arbitrary statistics: those runs yielded "
+            "parity and divisibility curiosities that are new and of no interest.\n\n"
             "Runs so far, with what each yielded — do not repeat a topic, and prefer areas "
             "unlike those where everything came back `known`:\n"
             f"{recent}\n\n"
@@ -1531,6 +1553,33 @@ class Forge:
             "against the informal one, and carry every remaining `## GAP` forward into "
             "section 5 instead of hiding it.\n\n"
             f"SEED TOPIC: {seed}\n\nRESULTS:\n{json.dumps(results, indent=2)}"
+        )
+
+    def revise(self, paper: str, report: str) -> str:
+        """The paper rewritten against a referee report. The evidence is what it was: nothing has been
+        re-run, so the rewrite may explain better but may not claim more."""
+        return self.ask(
+            "Revise the research paper below in response to the referee report. Return the complete "
+            "revised paper in Markdown with LaTeX, keeping its sections and their numbering, and nothing "
+            "else: no preamble, no code fence around it.\n\n"
+            "You may change the exposition: motivation and context, definitions made precise, notation, "
+            "steps of a proof written out, the place of the result among known ones, the limitations. "
+            "Mention a work only if the report or the paper names it, in no more detail than they give: "
+            "invent no reference, title, year or theorem number, and say that it was not consulted.\n\n"
+            "A proof may gain steps and clearer wording but must lose none: it was checked as written, "
+            "so do not compress, merge or re-derive it, whatever the report says about length.\n\n"
+            "You may NOT change what the paper establishes: the statement of each theorem, what was "
+            "searched and over which ranges, the Lean status and faithfulness verdict of each result, the "
+            "novelty disclaimer and its queries. No computation, formalization or literature search has "
+            "been run since the paper was written. Where the report asks for something that would need "
+            "one (larger ranges, a sorry-free Lean proof, a wider literature review, a stronger theorem), "
+            "do not claim it: record it in section 5 as open, attributed to the review. Where the report "
+            "finds a real error in a proof, say so plainly under a `## GAP` heading in section 5 and "
+            "state that the result is in doubt; do not argue it away. If the report calls a result "
+            "elementary or of limited interest and that is fair, say so in the introduction.\n\n"
+            "End with a section `6. Changes in response to review`: one bullet per point of the report, "
+            "saying what changed or why it could not.\n\n"
+            f"REFEREE REPORT:\n{report}\n\nPAPER:\n{paper}"
         )
 
 
@@ -1675,11 +1724,15 @@ def _for_paper(r: dict) -> dict:
     return slim
 
 
-def paper_models(results: list, models: dict | None) -> str:
-    """The paper's closing `## Models` section: who proposed, proved and checked each result."""
+def paper_models(results: list, models: dict | None, revised_by: str | None = None) -> str:
+    """The paper's closing `## Models` section: who proposed, proved and checked each result, and who
+    rewrote the paper against a review, which need not be the model that wrote it."""
     lines = ["## Models", ""]
     for r in results:
         lines += [f"**{r.get('title', r['id'])}** (`{r['status']}`)", "", *_model_lines(r, models), ""]
+    if revised_by:
+        lines += ["**Revision in response to the AiraXiv AI review** (exposition only; no result was re-checked)", "",
+                  f"- Revised against the review: {revised_by}", ""]
     return "\n".join(lines)
 
 
@@ -2060,6 +2113,13 @@ def _lakefile(package: str, lean_project: Path) -> str:
             '[[lean_lib]]\nname = "Solution"\nroots = ["Solution"]\n')
 
 
+def _namespace(folder_name: str) -> str:
+    """A valid Lean namespace from a result folder: `3-term-...` and `A240513-...` both broke the
+    lowercase-only version (a leading digit, a dropped capital)."""
+    name = "".join(w.capitalize() for w in re.findall(r"[A-Za-z0-9]+", folder_name))
+    return "Mathforge." + ("R" + name if name[:1].isdigit() else name)
+
+
 def palomar_bundle(forge: Forge, r: dict, folder: Path, classification: dict, maintainer: str) -> str:
     """Write a Palomar-ready Lake project into `folder`; returns "" or why not.
 
@@ -2070,7 +2130,7 @@ def palomar_bundle(forge: Forge, r: dict, folder: Path, classification: dict, ma
     main = _main_theorem(r)
     if not (project and lean.get("code") and main):
         return "no Lean project or Lean file"
-    namespace = "Mathforge." + "".join(w.capitalize() for w in re.findall(r"[a-z0-9]+", folder.name))
+    namespace = _namespace(folder.name)
     try:
         challenge, solution, qualified = palomar_split(lean["code"], main, namespace)
     except ValueError as exc:
@@ -2660,7 +2720,7 @@ AIRAXIV_MAX = 10  # per call, whatever was asked for; the site throttles well be
 AIRAXIV_PAPER_TYPE = "ai_generated"
 MATHFORGE_URL = "https://github.com/augusto-rehfeldt/mathforge"
 _MODEL_LINE = re.compile(r"(?m)^- (?:Models|Proposed the claim|Counterexample search|Independent[^:\n]*|Wrote the proof|Referee"
-                         r"|Lean formalization|Faithfulness judge): (.+)$")
+                         r"|Lean formalization|Faithfulness judge|Revised against the review): (.+)$")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -2715,10 +2775,182 @@ def airaxiv_tool(headers: dict, tool: str, arguments: dict) -> dict:
     return reply
 
 
+def _airaxiv_session(key: str) -> dict:
+    """Open an MCP session; the headers every later call carries."""
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "application/json"}
+    hello = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-03-26", "clientInfo": {"name": "mathforge", "version": "1.0"}, "capabilities": {}}}
+    got, _body = _airaxiv_http(AIRAXIV_MCP, body=json.dumps(hello).encode(), headers=headers)
+    session = next((value for name, value in got.items() if name.lower() == "mcp-session-id"), "")
+    if session:
+        headers["Mcp-Session-Id"] = session
+    _airaxiv_http(AIRAXIV_MCP, body=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}).encode(),
+                  headers=headers)
+    return headers
+
+
+def _airaxiv_close(headers: dict) -> None:
+    try:
+        _airaxiv_http(AIRAXIV_MCP, method="DELETE", headers={k: v for k, v in headers.items() if k != "Content-Type"})
+    except (OSError, ValueError):
+        pass
+
+
+def _airaxiv_upload(headers: dict, pdf_path: Path) -> tuple[str, str]:
+    """Upload one PDF; (the one-time pdf_file_id that submit_paper or update_paper takes, the PDF's sha256)."""
+    pdf = pdf_path.read_bytes()
+    digest = hashlib.sha256(pdf).hexdigest()
+    upload = airaxiv_tool(headers, "create_upload", {"filename": f"{pdf_path.stem.strip('_')}.pdf", "sha256": digest})
+    target = urllib.parse.urlsplit(str(upload["upload_url"]))
+    if target.scheme != "https":
+        raise RuntimeError(f"upload address is not https: {str(upload['upload_url'])[:80]}")
+    # the upload address may be another host's signed URL: the key goes only to AiraXiv itself
+    own = target.username is None and target.hostname == urllib.parse.urlsplit(AIRAXIV_MCP).hostname
+    _airaxiv_http(upload["upload_url"], method="PUT", body=pdf,
+                  headers={"Content-Type": "application/pdf", **({"Authorization": headers["Authorization"]} if own else {})})
+    return airaxiv_tool(headers, "complete_upload", {"upload_id": upload["upload_id"], "sha256": digest})["pdf_file_id"], digest
+
+
+def _airaxiv_save(record_file: Path, record: dict) -> None:
+    scratch = record_file.with_name("airaxiv.json.tmp")
+    scratch.write_text(json.dumps(record, indent=1, ensure_ascii=False), encoding="utf-8")
+    os.replace(scratch, record_file)
+
+
+def _airaxiv_authors(markdown: str) -> list:
+    """The pipeline, naming every model in the paper's Models section, and the person who ran it."""
+    models = sorted({m.strip() for line in _MODEL_LINE.findall(markdown) for m in line.split(",")} - {"not recorded"})
+    return [{"name": "mathforge pipeline" + (f" ({', '.join(models)})" if models else ""), "type": "ai", "url": MATHFORGE_URL},
+            {"name": _byline(), "type": "human"}]
+
+
+def _airaxiv_submission(entry: dict) -> str:
+    """The site's submission id in a record entry."""
+    reply = entry.get("reply") if isinstance(entry.get("reply"), dict) else {}
+    return str((reply["paper"] if isinstance(reply.get("paper"), dict) else reply).get("submission_id"))
+
+
 def submit_airaxiv(limit: int = AIRAXIV_BATCH) -> int:
     """Upload packaged papers to AiraXiv's AI-generated track: each package whose build is `ok` with no
     missing glyphs, once, at most `limit` (never more than AIRAXIV_MAX) per call, the refutations note first.
     One upload runs at a time (`airaxiv.lock`). Returns 1 if anything failed or is unresolved."""
+    return _airaxiv_locked(lambda out, key: _submit_airaxiv(out, key, max(0, min(limit, AIRAXIV_MAX))))
+
+
+def revise_airaxiv(forge_for, limit: int = AIRAXIV_BATCH) -> int:
+    """Answer AiraXiv's AI review, which arrives some time after a paper goes public: rewrite the run's paper
+    against the report, rebuild its package and upload it as a new version. At most `limit` rewrites per call,
+    each paper once. The rewrite is kept in state.json, so a refused upload is retried without it."""
+    return _airaxiv_locked(lambda out, key: _revise_airaxiv(out, key, forge_for, max(0, min(limit, AIRAXIV_MAX))))
+
+
+def _revise_airaxiv(out: Path, key: str, forge_for, limit: int) -> int:
+    record_file = out / "airaxiv.json"
+    try:
+        record = json.loads(record_file.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        log(f"airaxiv: cannot read airaxiv.json ({exc}); nothing revised")
+        return 1
+    failed, reports = 0, []
+    try:
+        headers = _airaxiv_session(key)
+    except (OSError, ValueError) as exc:
+        log(f"airaxiv: could not open a session: {_airaxiv_reason(exc)[:300]}")
+        return 1
+    try:
+        # the record holds submission ids; a paper has a public id, and a review, only once moderation passed it
+        public, offset = {}, 0
+        while True:
+            page = airaxiv_tool(headers, "list_papers", {"scope": "user", "limit": 100, "offset": offset}).get("papers") or []
+            public.update({str(p.get("submission_id")): str(p["paper_id"]) for p in page if isinstance(p, dict) and p.get("paper_id")})
+            offset += len(page)
+            if len(page) < 100:
+                break
+        for stem, entry in record.items():
+            # ponytail: one revision per paper, so the review of a revised version goes unanswered;
+            # record revisions per version if a second round is ever wanted
+            if len(reports) >= limit or not isinstance(entry, dict) or entry.get("revision") or stem.startswith("_"):
+                continue  # the refutations note has no run of its own to rewrite
+            paper_id = public.get(_airaxiv_submission(entry))
+            if not paper_id or not (OUTPUT_ROOT / stem / "state.json").exists():
+                continue
+            reviews = airaxiv_tool(headers, "get_paper_reviews", {"paper_id": paper_id}).get("reviews") or []
+            report = "\n\n".join(str(r.get("content") or "") for r in reviews if isinstance(r, dict)).strip()
+            if report:
+                reports.append((stem, paper_id, report))
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        failed += 1
+        log(f"airaxiv: reading reviews stopped: {_short(_airaxiv_reason(exc), 300)}")
+    finally:
+        _airaxiv_close(headers)
+
+    for stem, paper_id, report in reports:  # minutes each, so outside any session
+        try:
+            run = Run(OUTPUT_ROOT / stem)
+            old = str(run.data["paper"])
+            forge = forge_for(run)
+            new = re.sub(r"\A```\w*\s*\n|\n```\s*\Z", "", forge.revise(old, report).strip())
+            if not all(paper_meta(new)[:2]) or len(new) < len(old) // 2:
+                raise ValueError("the rewrite lost the title, the abstract or half the paper")
+            reviser = getattr(forge, "models", {}).get("writing") or "not recorded"
+            run.data.update(paper=new, paper_v1=old, airaxiv_review=report, paper_revised_by=reviser)
+            run.save()
+            keepers = [r for r in run.data.get("results") or [] if r.get("status") in ("machine-verified", "verified", "provisional")]
+            (run.path / "paper.md").write_text(new.rstrip() + "\n\n" + paper_models(keepers, run.data.get("models"), reviser), encoding="utf-8")
+            record[stem]["revision"] = {"paper_id": paper_id, "state": "written"}
+            _airaxiv_save(record_file, record)
+            log("airaxiv: " + _named(stem, f"rewritten against the review of {paper_id}"))
+        except Exception as exc:  # one paper's failure must not cost the others
+            failed += 1
+            log("airaxiv: " + _named(stem, f"NOT REVISED: {type(exc).__name__}: {_short(str(exc), 300)}"))
+
+    written = [stem for stem, entry in record.items()
+               if isinstance(entry, dict) and (entry.get("revision") or {}).get("state") == "written"]
+    if not written:
+        log("airaxiv: no review to answer")
+        return int(bool(failed))
+    if export_latex(_byline()) == EXPORT_ABORTED:
+        log("airaxiv: no revision sent, the submission folder could not be refreshed")
+        return 1
+    try:
+        statuses = json.loads((out / "status.json").read_text(encoding="utf-8"))
+        headers = _airaxiv_session(key)
+    except (OSError, ValueError) as exc:
+        log(f"airaxiv: no revision sent: {_airaxiv_reason(exc)[:300]}")
+        return 1
+    try:
+        for stem in written:
+            status = str(statuses.get(stem, "no longer packaged"))
+            try:
+                if not status.startswith("ok") or "glyphs missing" in status:
+                    raise RuntimeError(f"the revised package is not sendable: {status}")
+                markdown = (out / f"{stem}.md").read_text(encoding="utf-8")
+                title, abstract, _rest = paper_meta(markdown)
+                file_id, digest = _airaxiv_upload(headers, out / f"{stem}.pdf")
+                reply = airaxiv_tool(headers, "update_paper", {
+                    "author_list": _airaxiv_authors(markdown),  # the reviser may be a model the first version never used
+                    "paper_id": record[stem]["revision"]["paper_id"], "pdf_file_id": file_id, "title": title, "abstract": abstract,
+                    "version_notes": "Revised in response to the AiraXiv AI review; the last section lists the changes."})
+            except Exception as exc:
+                failed += 1
+                log("airaxiv: " + _named(stem, "REVISION NOT SENT: " + _short(_airaxiv_reason(exc), 300)))
+                if _airaxiv_busy(exc):
+                    log("airaxiv: rate limit or daily quota reached; written revisions are sent by a later call")
+                    break
+                continue
+            record[stem]["revision"].update(state="sent", updated=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                            sha256=digest, reply=reply)
+            _airaxiv_save(record_file, record)
+            log("airaxiv: " + _named(stem, f"revision sent for {record[stem]['revision']['paper_id']}"))
+    finally:
+        _airaxiv_close(headers)
+    return int(bool(failed))
+
+
+def _airaxiv_locked(work) -> int:
+    """Run `work(submission folder, API key)` as the one AiraXiv job in flight (`airaxiv.lock`)."""
     key = os.getenv("AIRAXIV_API_KEY")
     if not key:
         log("airaxiv: set AIRAXIV_API_KEY (airaxiv.com > My API Keys) in the environment or in .env")
@@ -2734,7 +2966,7 @@ def submit_airaxiv(limit: int = AIRAXIV_BATCH) -> int:
         log(f"airaxiv: nothing packaged yet ({exc})")
         return 1
     try:
-        return _submit_airaxiv(out, key, max(0, min(limit, AIRAXIV_MAX)))
+        return work(out, key)
     finally:
         lock.unlink(missing_ok=True)
 
@@ -2752,9 +2984,7 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
         return 1
 
     def save():
-        scratch = record_file.with_name("airaxiv.json.tmp")
-        scratch.write_text(json.dumps(record, indent=1, ensure_ascii=False), encoding="utf-8")
-        os.replace(scratch, record_file)
+        _airaxiv_save(record_file, record)
 
     # written before submit_paper and replaced by the reply: one left behind means the reply never arrived
     unresolved = [stem for stem, entry in record.items() if isinstance(entry, dict) and entry.get("state") == "submitting"]
@@ -2776,16 +3006,8 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
     if not pending:
         log("airaxiv: nothing new to submit")
         return int(bool(unresolved))
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "application/json"}
-    hello = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-        "protocolVersion": "2025-03-26", "clientInfo": {"name": "mathforge", "version": "1.0"}, "capabilities": {}}}
     try:
-        got, _body = _airaxiv_http(AIRAXIV_MCP, body=json.dumps(hello).encode(), headers=headers)
-        session = next((value for name, value in got.items() if name.lower() == "mcp-session-id"), "")
-        if session:
-            headers["Mcp-Session-Id"] = session
-        _airaxiv_http(AIRAXIV_MCP, body=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}).encode(),
-                      headers=headers)
+        headers = _airaxiv_session(key)
     except (OSError, ValueError) as exc:
         log(f"airaxiv: could not open a session: {_airaxiv_reason(exc)[:300]}")
         return 1
@@ -2795,18 +3017,7 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
             try:
                 markdown = (out / f"{stem}.md").read_text(encoding="utf-8")
                 title, abstract, _rest = paper_meta(markdown)
-                pdf = (out / f"{stem}.pdf").read_bytes()
-                digest = hashlib.sha256(pdf).hexdigest()
-                models = sorted({m.strip() for line in _MODEL_LINE.findall(markdown) for m in line.split(",")} - {"not recorded"})
-                upload = airaxiv_tool(headers, "create_upload", {"filename": f"{stem.strip('_')}.pdf", "sha256": digest})
-                target = urllib.parse.urlsplit(str(upload["upload_url"]))
-                if target.scheme != "https":
-                    raise RuntimeError(f"upload address is not https: {str(upload['upload_url'])[:80]}")
-                # the upload address may be another host's signed URL: the key goes only to AiraXiv itself
-                own = target.username is None and target.hostname == urllib.parse.urlsplit(AIRAXIV_MCP).hostname
-                _airaxiv_http(upload["upload_url"], method="PUT", body=pdf,
-                              headers={"Content-Type": "application/pdf", **({"Authorization": headers["Authorization"]} if own else {})})
-                file_id = airaxiv_tool(headers, "complete_upload", {"upload_id": upload["upload_id"], "sha256": digest})["pdf_file_id"]
+                file_id, digest = _airaxiv_upload(headers, out / f"{stem}.pdf")
                 stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 record[stem] = {"title": title, "submitted": stamp, "state": "submitting"}
                 save()
@@ -2814,9 +3025,7 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
                     reply = airaxiv_tool(headers, "submit_paper", {
                         "title": title, "abstract": abstract, "pdf_file_id": file_id,
                         "paper_type": AIRAXIV_PAPER_TYPE, "research_category": "theoretical",
-                        "author_list": [{"name": "mathforge pipeline" + (f" ({', '.join(models)})" if models else ""),
-                                         "type": "ai", "url": MATHFORGE_URL},
-                                        {"name": _byline(), "type": "human"}]})
+                        "author_list": _airaxiv_authors(markdown)})
                 except (RuntimeError, urllib.error.HTTPError) as refusal:
                     # the site said no, so nothing was accepted. A busy site may be asked again later; a paper it
                     # turned down is kept out of the queue until its PDF changes, or it would be refused every call
@@ -2839,10 +3048,7 @@ def _submit_airaxiv(out: Path, key: str, limit: int) -> int:
             paper = reply.get("paper") if isinstance(reply.get("paper"), dict) else reply
             log("airaxiv: " + _named(stem, f"submitted as #{paper.get('submission_id', '?')}"))
     finally:
-        try:
-            _airaxiv_http(AIRAXIV_MCP, method="DELETE", headers={k: v for k, v in headers.items() if k != "Content-Type"})
-        except (OSError, ValueError):
-            pass
+        _airaxiv_close(headers)
     return int(bool(failed))
 
 
@@ -2962,8 +3168,8 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
         paper = run.stage("paper", lambda: forge.paper(seed, [_for_paper(r) for r in keepers]))
         # appended at write time, not cached: the paper model cannot misreport it,
         # and papers cached before this existed gain it on --resume
-        (run.path / "paper.md").write_text(paper.rstrip() + "\n\n" + paper_models(keepers, run.data.get("models")),
-                                           encoding="utf-8")
+        (run.path / "paper.md").write_text(
+            paper.rstrip() + "\n\n" + paper_models(keepers, run.data.get("models"), run.data.get("paper_revised_by")), encoding="utf-8")
         paper_path = run.path / "paper.md"
 
     published = publish(forge, seed, results) if getattr(args, "publish", False) else []
@@ -2999,6 +3205,11 @@ def research_run(forge_for, seed: str, args, run: Run | None = None) -> dict:
             export_and_submit(getattr(args, "submit_airaxiv", None))
         except Exception as exc:
             log(f"export failed: {type(exc).__name__}: {exc}")
+    if getattr(args, "revise_airaxiv", None) is not None:
+        try:  # reviews arrive days after a submission, so every run looks
+            revise_airaxiv(forge_for, args.revise_airaxiv)
+        except Exception as exc:
+            log(f"airaxiv revision failed: {type(exc).__name__}: {exc}")
     return summary
 
 
@@ -3081,6 +3292,16 @@ def main(argv=None) -> int:
              "--forever it uploads after every run. Needs AIRAXIV_API_KEY (environment or .env)",
     )
     ap.add_argument(
+        "--revise-airaxiv",
+        nargs="?",
+        type=int,
+        const=AIRAXIV_BATCH,
+        metavar="N",
+        help="answer the AI review airaxiv.com posts on a public paper: rewrite up to N (default %(const)s) reviewed "
+             "papers against their report and upload each as a new version, once per paper. Alone it revises and exits; "
+             "with a seed, --resume or --forever it does so after every run. Needs AIRAXIV_API_KEY",
+    )
+    ap.add_argument(
         "--setup-lean",
         action="store_true",
         help=f"create a Mathlib Lake project at {DEFAULT_LEAN_PROJECT} and exit (multi-GB download)",
@@ -3100,11 +3321,12 @@ def main(argv=None) -> int:
         return setup_lean(Path(args.lean_project) if args.lean_project else DEFAULT_LEAN_PROJECT)
 
     researching = bool(args.seed or args.resume or args.forever or args.runs > 1 or args.publish_existing)
-    if args.export_latex or (args.submit_airaxiv is not None and not researching):
+    revising = args.revise_airaxiv is not None and not researching  # needs the models, unlike an upload
+    if args.export_latex or (args.submit_airaxiv is not None and not researching and not revising):
         load_local_env(HERE / ".env")  # AIRAXIV_API_KEY: this project's own .env, not the ai-suite checkout's
         return export_and_submit(args.submit_airaxiv, retry=args.export_latex)
 
-    if not researching:
+    if not researching and not revising:
         ap.error("give a seed topic, --resume a run directory, or --forever")
 
     lean_project = None if args.no_lean else find_lean_project(args.lean_project)
@@ -3164,6 +3386,10 @@ def main(argv=None) -> int:
 
     def forge_for(run: Run) -> Forge:
         return Forge(ai, run, lean_project, search=not args.no_search)
+
+    if revising:
+        failed = revise_airaxiv(forge_for, args.revise_airaxiv)
+        return (export_and_submit(args.submit_airaxiv) if args.submit_airaxiv is not None else 0) or failed
 
     if args.publish_existing:
         runs = sorted(p.parent for p in OUTPUT_ROOT.glob("*/state.json") if not p.parent.name.startswith("_"))
@@ -3778,6 +4004,9 @@ def _selftest() -> None:
                 "set_option pp.fullNames true in\n#print axioms refutation\n")
     challenge, solution, qualified = palomar_split(lean_src, "refutation", "Mathforge.T")
     assert qualified == "Mathforge.T.refutation", qualified
+    # a Lean identifier cannot start with a digit, and seqforge folders start with an uppercase A-number
+    assert _namespace("A240513-c1234567") == "Mathforge.A240513C1234567", _namespace("A240513-c1234567")
+    assert _namespace("3-term-ap-free-c2") == "Mathforge.R3TermApFreeC2", _namespace("3-term-ap-free-c2")
     assert "def f" in challenge and "private" not in challenge + solution and "helper" not in challenge
     assert "-- FAITHFULNESS" in challenge and challenge.count("sorry") == 1 and "¬ (∀ n, f n = n) := by\n  sorry" in challenge
     assert "lemma helper" in solution and "#print" not in solution and "set_option maxRecDepth" in solution
@@ -4011,6 +4240,7 @@ def _selftest() -> None:
 
     # AiraXiv upload: asked for, a few papers per call, each package once, the refutations note first
     real_root, real_http, real_key = globals()["OUTPUT_ROOT"], globals()["_airaxiv_http"], os.environ.pop("AIRAXIV_API_KEY", None)
+    real_export = export_latex
     sent = []
 
     def _fake_airaxiv(url, method="POST", body=None, headers=None):
@@ -4027,7 +4257,9 @@ def _selftest() -> None:
             result = {"isError": True, "content": [{"text": "rejected"}]}
         else:
             reply = {"create_upload": {"upload_id": "u1", "upload_url": "https://files.example/u1"},
-                     "complete_upload": {"pdf_file_id": "f1"}, "submit_paper": {"submission_id": "s1"}}[tool]
+                     "complete_upload": {"pdf_file_id": "f1"}, "submit_paper": {"submission_id": "s1"},
+                     "list_papers": {"papers": [{"submission_id": "s1", "paper_id": "2610.1"}, {"submission_id": "s9", "paper_id": None}]},
+                     "get_paper_reviews": {"reviews": [{"content": "Unclear."}]}, "update_paper": {"version": 2}}[tool]
             result = {"content": [{"text": json.dumps(reply)}]}
         return {}, json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}).encode()
 
@@ -4097,7 +4329,30 @@ def _selftest() -> None:
         assert submit_airaxiv(9) == 1 and quota_hits == [1], quota_hits
         assert json.loads((pack / "airaxiv.json").read_text(encoding="utf-8")) == {}, "a quota is not a refusal of the paper"
         assert _airaxiv_busy(RuntimeError("submit_paper: Daily quota exceeded")) and not _airaxiv_busy(RuntimeError("bad PDF"))
+
+        # a review is answered once: the run's paper is rewritten, and the new PDF goes up as a version of the public paper
+        globals()["_airaxiv_http"], globals()["export_latex"] = _fake_airaxiv, lambda author, retry=False: 0
+        (pack / "airaxiv.json").write_text(json.dumps({"a": {"reply": {"submission_id": "s1"}}, "z": {"reply": {"submission_id": "s9"}},
+                                                       REFUTATIONS: {"reply": {"submission_id": "s1"}}}), encoding="utf-8")
+        reviewed = Run(tmp / "_air" / "a")
+        reviewed.data.update(paper="# Ta\n\n## Abstract\n\nab a\n", results=[])
+        reviewed.save()
+        rewriter = lambda run: type("Rewriter", (), {"revise": staticmethod(
+            lambda paper, report: f"```markdown\n{paper}\n## 6. Changes\n\n{report}\n```")})
+        sent.clear()
+        assert revise_airaxiv(rewriter, 5) == 0
+        updates = [json.loads(c[2])["params"]["arguments"] for c in sent if c[0] == "POST" and b"update_paper" in c[2]]
+        assert len(updates) == 1 and updates[0]["paper_id"] == "2610.1" and updates[0]["pdf_file_id"] == "f1", updates
+        assert "Revised against the review: not recorded" in (tmp / "_air" / "a" / "paper.md").read_text(encoding="utf-8")
+        assert "- Revised against the review: m9" in paper_models([], None, "m9") and "Revised" not in paper_models([], None)
+        record = json.loads((pack / "airaxiv.json").read_text(encoding="utf-8"))
+        assert record["a"]["revision"]["state"] == "sent" and "revision" not in record["z"] and "revision" not in record[REFUTATIONS], record
+        state = Run(tmp / "_air" / "a").data
+        assert state["paper"].startswith("# Ta") and "Unclear." in state["paper"] and state["paper_v1"] == "# Ta\n\n## Abstract\n\nab a\n", state
+        sent.clear()
+        assert revise_airaxiv(rewriter, 5) == 0 and not [c for c in sent if c[0] == "PUT"], "one revision per paper"
     finally:
+        globals()["export_latex"] = real_export
         globals()["OUTPUT_ROOT"], globals()["_airaxiv_http"] = real_root, real_http
         os.environ.pop("AIRAXIV_API_KEY", None)
         if real_key is not None:

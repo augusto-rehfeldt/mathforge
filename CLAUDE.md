@@ -99,6 +99,15 @@ enumerate ..." produced "theorems" confined to the enumerated range, which the
 search decides outright (the 2026-08-15 Motzkin run's three `verified` results
 were of that kind).
 
+`RULES`, `propose_one` and `next_seed` also ask for importance (2026-10-02): a
+tractable case of a question specialists work on, an exact formula, a bijection, a
+sharp bound, a classification, with a `why_it_matters` field in each proposal.
+AiraXiv's reviews of the first papers called them correct and routine (a parity or
+divisibility fact about an arbitrarily refined count, proved by one symmetry), so the
+prompts name that shape as the thing to avoid. `RULES` no longer limits proofs to
+"elementary means", only to arguments that can be written out in full. Nothing
+scores importance after the proposal; it is a prompt, not a gate.
+
 `sorry_free` is decided by Lean itself: `_axiom_probe` appends `#print axioms`
 for every theorem (qualified by its `namespace`), and `lean_verdict` requires at
 least one report and nothing outside `propext`/`Classical.choice`/`Quot.sound` —
@@ -300,6 +309,25 @@ would block the others, on every call. The request shape matches the endpoint's 
 2026-10-01 (submission 1104). `AIRAXIV_API_KEY` is read from this project's `.env`
 (`load_local_env(HERE / ".env")`); a bare `load_local_env()` reads the ai-suite
 checkout's `.env` instead.
+
+`revise_airaxiv` (`--revise-airaxiv [N]`) answers the AI review the site posts on a
+public paper some time after moderation. Under the same `airaxiv.lock`: `list_papers`
+maps the record's submission ids to public paper ids, `get_paper_reviews` fetches each
+report, the session closes, `Forge.revise` rewrites the run's cached `paper` (the
+original is kept as `paper_v1`, the report as `airaxiv_review`, `paper.md` is
+rewritten), `export_latex` rebuilds the package, and a second session uploads the PDF
+and calls `update_paper`. The record entry gains `revision`: `{"state": "written"}`
+after the rewrite, `"sent"` after the upload, so a quota refusal costs only the upload
+and the next call retries it without another model call. One revision per paper; the
+review of the revised version is not answered. The refutations note has no run and is
+skipped. `Forge.revise` may change exposition only: theorem statements, search ranges,
+Lean status and the novelty disclaimer stay, and what the report asks for beyond the
+existing evidence goes into section 5 as open. A rewrite that loses the title, the
+abstract or half the text is rejected. The rewriting model is rarely the one that wrote
+the paper: it is stored as `paper_revised_by`, `paper_models` adds a `Revised against
+the review:` line to the Models section, and `update_paper` resends the author list
+(`_airaxiv_authors`) so the site's byline names it too. Unlike an upload it needs the models, so alone
+it goes through the provider setup in `main`.
 
 The novelty search also asks AiraXiv (`search_airaxiv`, no key): its public search page
 is scraped for result cards, so a result this pipeline already uploaded there is seen as

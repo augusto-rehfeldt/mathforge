@@ -771,10 +771,12 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
                 multi: bool = False) -> str | None:
     """Arrow-key menu on a Windows console, MENU_ROWS rows at a time.
 
-    Up/Down (or W/S)/PgUp/PgDn/Home/End move, Space selects or deselects the row under the
-    cursor, Enter confirms the selection (the cursor row when nothing is selected),
-    Esc keeps the default, Tab cycles `sorts` [(name, ids in order)]. Opens with the
-    default selected. On confirm the menu collapses to one "<name>: <pick>" line.
+    Up/Down/PgUp/PgDn/Home/End move. Typing filters the rows to ids containing the typed
+    text (case-insensitive, matches highlighted); Backspace erases. Space selects or
+    deselects the row under the cursor, Enter confirms the selection (the cursor row when
+    nothing is selected or a filter is typed), Esc clears the filter, else keeps the
+    default, Tab cycles `sorts` [(name, ids in order)]. Opens with the default selected.
+    On confirm the menu collapses to one "<name>: <pick>" line.
     multi=True: Space toggles rows, numbered in the order picked; default and result are
     comma-joined ids in that order, and Enter with nothing picked returns "".
     Returns None off a console so callers fall back to typing.
@@ -787,12 +789,26 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
     sorts = sorts or [("", [rid for rid, _ in rows])]
     sort = 0
     picks = [d for d in (default.split(",") if multi else [default]) if d in text]
-    cur = sorts[0][1].index(picks[0]) if picks else 0
+    at = picks[0] if picks else sorts[0][1][0]  # the id under the cursor
+    query = ""
     top = drawn = 0
     _enable_ansi()
-    keys = "↑↓/W S move · Space select · Enter confirm · Esc default"
+    keys = "↑↓ move · type to filter · Space select · Enter confirm · Esc default"
     if len(sorts) > 1:
         keys += " · Tab sort"
+    color = _color("x", "7") != "x"
+
+    def mark(label: str, rid: str) -> str:
+        """Reverse video on the match, inside the id when the label shows it. Turned off
+        with 27 alone, so the cursor row keeps its own color."""
+        if not query or not color:
+            return label
+        start = label.find(rid)
+        found = rid.lower().find(query.lower()) + start if start >= 0 else label.lower().find(query.lower())
+        if found < 0:
+            return label
+        end = found + len(query)
+        return f"{label[:found]}\033[7m{label[found:end]}\033[27m{label[end:]}"
 
     def redraw(lines: list[str]) -> None:
         nonlocal drawn
@@ -806,16 +822,18 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
         return picked
 
     while True:
-        order = sorts[sort][1]
+        order = [rid for rid in sorts[sort][1] if query.lower() in rid.lower()]
+        cur = order.index(at) if at in order else 0
         top = min(max(top, cur - MENU_ROWS + 1), cur)
         shown = order[top:top + MENU_ROWS]
         sorted_by = f"  sorted by {sorts[sort][0]}" if len(sorts) > 1 else ""
-        lines = [_color(title, "1") + _color(sorted_by, "2")]
+        typed = f"  filter: {_color(query, '1;33')}" if query else ""
+        lines = [_color(title, "1") + _color(sorted_by, "2") + typed]
         for i, rid in enumerate(shown):
-            mark = (str(picks.index(rid) + 1) if multi else "x") if rid in picks else " "
-            row = f"[{mark}] {text[rid]}"
+            tick = (str(picks.index(rid) + 1) if multi else "x") if rid in picks else " "
+            row = f"[{tick}] {mark(text[rid], rid)}"
             lines.append(_color(f"  > {row}", "1;36") if top + i == cur else f"    {row}")
-        scroll = f"{top + 1}-{top + len(shown)} of {len(order)}"
+        scroll = f"{top + 1}-{top + len(shown)} of {len(order)}" if order else "no match"
         lines.append(_color(f"    {scroll} · {keys}", "2"))
         lines += [_color(line, "2") for line in footer.splitlines()]
         redraw(lines)
@@ -823,23 +841,31 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
         if ch in "\x00\xe0":  # arrow/function key: the second half says which
             step = {"H": -1, "P": 1, "I": -MENU_ROWS, "Q": MENU_ROWS,
                     "G": -len(order), "O": len(order)}.get(msvcrt.getwch(), 0)
-            cur = min(max(cur + step, 0), len(order) - 1)
-        elif ch in "wWsS":
-            cur = min(max(cur + (-1 if ch in "wW" else 1), 0), len(order) - 1)
+            cur = min(max(cur + step, 0), max(len(order) - 1, 0))
         elif ch == " ":
-            if order[cur] in picks:
+            if order and order[cur] in picks:
                 picks.remove(order[cur])
-            else:
+            elif order:
                 picks = [*picks, order[cur]] if multi else [order[cur]]
         elif ch in "\r\n":
-            return done(",".join(picks) if multi else (picks or [order[cur]])[0])
+            if multi:
+                return done(",".join(picks))
+            if order:
+                return done(order[cur] if query else (picks or [order[cur]])[0])
         elif ch == "\t" and len(sorts) > 1:
             sort = (sort + 1) % len(sorts)
-            cur = sorts[sort][1].index(order[cur])
+        elif ch == "\x08":
+            query = query[:-1]
         elif ch in "\x1b\x1a":
-            return done(default)
+            if not query:
+                return done(default)
+            query = ""
         elif ch == "\x03":
             raise KeyboardInterrupt
+        elif ch.isprintable():
+            query += ch
+        if order:
+            at = order[cur]
 
 
 def _pick_model(title: str, rows: list[tuple[str, dict]], default_model: str, role: str,

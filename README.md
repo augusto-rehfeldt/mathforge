@@ -154,6 +154,17 @@ pandoc). A paper the site refuses is recorded as `refused` and not offered again
 until its PDF changes. The site's terms forbid
 large-scale automated submission: keep N small, and read what you send.
 
+`--revise-airaxiv [N]` answers the AI review AiraXiv posts on a public paper some
+time after it appears: it rewrites up to N (default 3) reviewed papers against
+their report, rebuilds the package and uploads it as a new version, once per paper.
+Alone it revises and exits; with a seed, `--resume` or `--forever` it looks after
+every run. The rewrite changes the exposition, never what the paper establishes:
+requests that would need new computation, a complete Lean proof or a wider
+literature review are listed as open in section 5, and the last section says what
+changed for each point of the report. The original text stays in `state.json` as
+`paper_v1`. A rewrite whose upload the site refuses (daily quota) is sent by the
+next call.
+
 ### Lean
 
 Formalization is skipped unless a Mathlib project is present. To enable it:
