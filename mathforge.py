@@ -3064,10 +3064,11 @@ def export_and_submit(limit: int | None, retry: bool = False) -> int:
     return submit_airaxiv(limit) or failed
 
 
-def latest_run_dir() -> Path | None:
+def latest_run_dir(root: Path | None = None) -> Path | None:
     """The most recently touched run, for a bare `--resume`. Underscore-prefixed
     scratch directories (`_scout`, `_selftest`) are not runs."""
-    runs = [p.parent for p in OUTPUT_ROOT.glob("*/state.json") if not p.parent.name.startswith("_")]
+    root = OUTPUT_ROOT if root is None else root
+    runs = [p.parent for p in root.glob("*/state.json") if not p.parent.name.startswith("_")]
     return max(runs, key=lambda p: (p / "state.json").stat().st_mtime, default=None)
 
 
@@ -4458,11 +4459,15 @@ def _selftest() -> None:
         (newer / "state.json").write_text("{}", encoding="utf-8")
         os.utime(newer / "state.json", (time.time() + 60, time.time() + 60))
         assert latest_run_dir() == newer, latest_run_dir()
+        assert latest_run_dir(tmp / "missing") is None
+        assert latest_run_dir(tmp) == newer
         scratch = tmp / "_scout"  # scratch dirs are not runs
         scratch.mkdir(parents=True, exist_ok=True)
         (scratch / "state.json").write_text("{}", encoding="utf-8")
         os.utime(scratch / "state.json", (time.time() + 120, time.time() + 120))
         assert latest_run_dir() == newer, latest_run_dir()
+        assert latest_run_dir(tmp / "missing") is None
+        assert latest_run_dir(tmp) == newer
         append_index({"seed": "A Topic", "finished": "now", "tally": {"verified": 1}, "path": "a-topic", "paper": "a-topic/paper.md"})
         append_index({"seed": "B Topic", "finished": "later", "tally": {"known": 2}, "path": "b-topic", "paper": None})
         assert len(json.loads((tmp / "index.json").read_text(encoding="utf-8"))) == 2
