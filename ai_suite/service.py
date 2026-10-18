@@ -66,16 +66,22 @@ def _openai_oauth_proxy_running() -> bool:
         return False
 
 
+# shortcut: local build of EvanZhouDev/openai-oauth#47 (Codex prompt caching) wins over
+# npx @latest while it exists; delete the folder once a release includes the fix.
+OPENAI_OAUTH_PATCHED = Path.home() / ".config" / "cc" / "openai-oauth-patched" / "node_modules" / ".bin" / "openai-oauth.cmd"
+
+
 def ensure_openai_oauth_proxy(*, log: Optional[Callable[[str], None]] = None) -> None:
     if _openai_oauth_proxy_running():
         return
     npx = shutil.which("npx.cmd") or shutil.which("npx")
-    if not npx:
+    command = [str(OPENAI_OAUTH_PATCHED)] if OPENAI_OAUTH_PATCHED.is_file() else [npx, "openai-oauth@latest"]
+    if not command[0]:
         raise RuntimeError("OpenAI OAuth requires Node.js with npx on PATH.")
     (log or print)("Starting the OpenAI OAuth proxy; complete browser sign-in if prompted...")
     try:
         options = {"capture_output": True, "text": True} if log is not None else {}
-        result = subprocess.run([npx, "openai-oauth@latest", "--detach"], check=True,
+        result = subprocess.run([*command, "--detach"], check=True,
                                 **options, **background_process_options())
         if log is not None:
             for line in ((result.stdout or "") + "\n" + (result.stderr or "")).splitlines():
