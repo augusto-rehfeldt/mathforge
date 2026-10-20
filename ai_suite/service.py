@@ -1569,6 +1569,9 @@ class AIService:
             if not getattr(self, "_opencode_session", None):
                 self._opencode_session = uuid.uuid4().hex
             headers.setdefault("x-opencode-session", self._opencode_session)
+        # Cloudflare (opencode.ai, api.commandcode.ai) answers Python's default user agents
+        # with 403 "error code: 1010".
+        headers.setdefault("User-Agent", "Mozilla/5.0 ai-suite")
         return headers
 
     @staticmethod

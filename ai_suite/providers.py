@@ -322,7 +322,18 @@ def _tokens(n: int) -> str:
     return f"{n / 1e6:.3g}M" if n >= 999_500 else f"{round(n / 1e3)}K"
 
 
-SORT_KEYS = {"price": "price", "ctx": "context", "AA": "intelligence", "score": "aggregate score"}
+SORT_KEYS = {"score": "aggregate score", "AA": "intelligence", "ctx": "context", "price": "price"}
+
+
+def _missing(info: dict) -> int:
+    """How many displayed facts this model lacks; such rows always go to the bottom."""
+    context = (info.get("limit") or {}).get("context")
+    cost = info.get("cost") or {}
+    count = int(not context)  # the same truth test _facts_label and _scales use
+    count += int("input" not in cost or "output" not in cost)
+    if _artificial_analysis():
+        count += int(info.get("intelligence") is None)
+    return count
 
 
 def _scales(infos: list[dict]) -> list[dict]:
@@ -450,7 +461,10 @@ def _live_model_ids(provider: str) -> set[str] | None:
         if provider == "commandcode":
             listing = _cli_listing(["cmdc", "--list-models"], CMDC_MODELS_CACHE)
             # Model rows start at column 0 with an id; headings ("Available models", "Open
-            # Source") have no dash or slash in their first word.
+            # Source") have no dash or slash in their first word. The trailing decision-model
+            # section is not a chat model, so stop at its heading (a row's description may
+            # mention the words, so the match is anchored to the line start).
+            listing = re.split(r"(?m)^Decision models", listing)[0]
             return {word.lower() for word in (line.split()[0] for line in listing.splitlines()
                     if line.strip() and not line[0].isspace()) if "-" in word or "/" in word} or None
         if provider == "opencode-zen":
@@ -766,9 +780,13 @@ def _loading(what: str):
         label.hide()
 
 
+class MenuBack(Exception):
+    """The user pressed Escape in a menu with back navigation enabled."""
+
+
 def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: str = "",
                 sorts: list[tuple[str, list[str]]] | None = None, name: str = "",
-                multi: bool = False) -> str | None:
+                multi: bool = False, back: bool = False) -> str | None:
     """Arrow-key menu on a Windows console, MENU_ROWS rows at a time.
 
     Up/Down/PgUp/PgDn/Home/End move. Typing filters the rows to ids containing the typed
@@ -780,6 +798,7 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
     multi=True: Space toggles rows, numbered in the order picked; default and result are
     comma-joined ids in that order, and Enter with nothing picked returns "".
     Returns None off a console so callers fall back to typing.
+    back=True: Esc raises MenuBack instead of clearing the filter or confirming a default.
     """
     if os.name != "nt" or not sys.stdin.isatty() or not sys.stdout.isatty():
         # ponytail: Windows console only; termios raw mode if that's ever needed.
@@ -793,7 +812,8 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
     query = ""
     top = drawn = 0
     _enable_ansi()
-    keys = "↑↓ move · type to filter · Space select · Enter confirm · Esc default"
+    keys = "↑↓ move · type to filter · Space select · Enter confirm · " + (
+        "Esc back · Ctrl+C quit" if back else "Esc default")
     if len(sorts) > 1:
         keys += " · Tab sort"
     color = _color("x", "7") != "x"
@@ -856,6 +876,9 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
             sort = (sort + 1) % len(sorts)
         elif ch == "\x08":
             query = query[:-1]
+        elif ch == "\x1b" and back:
+            redraw([])
+            raise MenuBack
         elif ch in "\x1b\x1a":
             if not query:
                 return done(default)
@@ -869,24 +892,28 @@ def _arrow_menu(title: str, rows: list[tuple[str, str]], default: str, footer: s
 
 
 def _pick_model(title: str, rows: list[tuple[str, dict]], default_model: str, role: str,
-                paid_by: str, normalize=None) -> str:
-    """Arrow-key model menu (`_arrow_menu`), cheapest first; Tab re-sorts by the next
-    of SORT_KEYS, best first. Off a console: numbered list, number or id typed."""
+                paid_by: str, normalize=None, back: bool = False) -> str:
+    """Arrow-key model menu (`_arrow_menu`), best aggregate score first; Tab re-sorts
+    by the next of SORT_KEYS, best first. Rows missing a displayed fact go last.
+    Off a console: numbered list, number or id typed."""
     ids = [mid for mid, _ in sorted(rows, key=lambda row: _cost_key(row[1]))]
     infos = dict(rows)
     scales = dict(zip(infos, _scales(list(infos.values()))))
+    missing = {mid: _missing(infos[mid]) for mid in ids}
     width = max(map(len, ids))
     default_tag = "  " + _color("default", "2")
     label = {mid: f"{mid:<{width}}  {_facts_label(infos[mid], scales[mid])}"
                   f"{default_tag if mid == default_model else ''}" for mid in ids}
-    # Stable over the price order, so ties stay cheapest first; unknowns go last.
-    sorts = [(name, sorted(ids, key=lambda mid: -scales[mid].get(key, -1)))
-             for key, name in SORT_KEYS.items()]
+    # Unknowns go last; ties stay cheapest first. Only keys some row actually has: an
+    # all-empty column would just repeat the price order under a label that promises otherwise.
+    known = {key for s in scales.values() for key in ("AA", "ctx", "price") if key in s}
+    sorts = [(name, sorted(ids, key=lambda mid: (missing[mid] > 0, missing[mid], -scales[mid].get(key, -1))))
+             for key, name in SORT_KEYS.items() if key == "score" or key in known]
     legend = f"    $ = API list price per 1M in/out tokens{paid_by}; -> = aggregate score 0-100."
     name = f"{role.capitalize()} model" if role else "Model"
     heading = f"{name} · {title}"
     picked = _arrow_menu(heading, [(mid, label[mid]) for mid in ids], default_model, legend, sorts,
-                         name=name)
+                         name=name, back=back)
     if picked is not None:
         return picked
 
@@ -987,13 +1014,13 @@ def _effort_levels(provider: str, mid: str) -> list[str]:
     return []
 
 
-def _prompt_effort(levels: list[str], default: str, role: str = "") -> str:
+def _prompt_effort(levels: list[str], default: str, role: str = "", back: bool = False) -> str:
     """Arrow-key effort menu: the model's own levels, or "" for the provider's default."""
     name = f"{role.capitalize()} effort" if role else "Effort"
     rows = [("default", "default  the provider's own")] + [(level, level) for level in levels]
     # ponytail: asked on a console only. Off one the remembered pick stands, because a
     # typed prompt here would eat the next scripted answer of a piped run.
-    picked = _arrow_menu(name, rows, default or "default", name=name)
+    picked = _arrow_menu(name, rows, default or "default", name=name, back=back)
     return default if picked is None else "" if picked == "default" else picked
 
 
